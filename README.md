@@ -1,16 +1,93 @@
-# <img src="static/logo.png" alt="" width="32"> agentchattr
+# <img src="static/logo.png" alt="" width="32"> aagentchattr — operations & autonomy fork
 
 ![Windows](https://img.shields.io/badge/platform-Windows-blue) ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey) ![Linux](https://img.shields.io/badge/platform-Linux-orange) ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-green) [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/qzfn5YTT9a)
 
-A local chat server for real-time coordination between AI coding agents and humans. Ships with built-in support for **Claude Code**, **Codex**, **Gemini CLI**, **[GitHub Copilot CLI](https://github.com/github/copilot-cli)**, **Kimi**, **Qwen**, **Kilo CLI**, **[CodeBuddy](https://www.codebuddy.ai/cli)**, and **[MiniMax](https://platform.minimax.io)** — and any MCP-compatible agent can join.
+An operations-focused fork of [agentchattr](https://github.com/bcurts/agentchattr) for reliable autonomous multi-agent development: durable task queues and delivery, crash-safe recovery, model- and quota-aware scheduling, safeguard handling, Windows process containment, auditable checkpoints, and fail-closed orchestration.
+
+The upstream project is a local chat server for real-time coordination between AI coding agents and humans. This fork preserves that interactive experience and extends it toward supervised, unattended work. It supports **Claude Code**, **Codex**, **Gemini CLI**, **[GitHub Copilot CLI](https://github.com/github/copilot-cli)**, **Kimi**, **Qwen**, **Kilo CLI**, **[CodeBuddy](https://www.codebuddy.ai/cli)**, **[MiniMax](https://platform.minimax.io)**, and other MCP-compatible agents.
 
 Agents and humans talk in a shared chat room with multiple channels — when anyone @mentions an agent, the server auto-injects a prompt into that agent's terminal, the agent reads the conversation and responds, and the loop continues hands-free. No copy-pasting between ugly terminals. No manual prompting.
+
+> [!IMPORTANT]
+> The interactive chat features remain usable today. The unattended autonomy control plane described below is under active development and is **not enabled by default or admitted for production work**. Its current sealed runner is deliberately a deterministic readiness no-op: it does not claim queue work, start product processes, or mutate product files. Until the end-to-end safety gates pass, use autonomy components only with disposable test tasks and explicit human oversight.
+
+## Why this fork exists
+
+Interactive agent chat solves communication, but long-running autonomous work also needs durable authority, bounded execution, and recovery after terminals, wrappers, models, or the host machine fail. This fork is being built around the following goals:
+
+- **One durable backlog** — task authority lives in validated files and append-only evidence, not only in chat history or model context.
+- **Exact admission** — every attempt is bound to a task, profile, model, payload digest, generation, and execution policy before anything starts.
+- **Fail-closed execution** — missing, stale, ambiguous, or conflicting evidence stops dispatch instead of guessing or silently repairing state.
+- **No silent model fallback** — a task runs only on its assigned model; exhausted quota or a safeguard pause causes an explicit defer, retry, or escalation.
+- **Crash-safe ownership** — leases, checkpoints, heartbeats, process containment, and idempotent replay make interrupted work observable and recoverable.
+- **Independent acceptance** — completion and acceptance are separate steps; a task is not declared clean while required checks are still running.
+- **Local-first operation** — the server remains localhost-oriented, and autonomous execution is restricted to explicitly admitted roots and commands.
+
+## Fork status
+
+| Area | Status | Scope |
+|------|--------|-------|
+| Interactive chat, channels, jobs, rules, sessions, and MCP tools | Available | Preserved from upstream and incrementally hardened |
+| Windows Job Object containment | Implemented in `autonomy` | Suspended launch, verified containment, kill-on-close, bounded cleanup |
+| Quota-capacity decisions | Implemented in `autonomy` | Read-only, model-aware, fail-closed interpretation of a normalized local quota cache |
+| Task Scheduler boundary | Implemented in `autonomy` | Hash-bound task definitions, exact observation, idempotent registration and removal |
+| Control state and synthetic canary worker | Implemented in `autonomy` | Durable HALT/attempt evidence plus a test-only worker for admission probes |
+| Durable queue, attempts, checkpoints, heartbeats, and tick state | Active development | Exact-CAS claims, bounded retries, recovery evidence, and deterministic planning |
+| Durable prompt delivery and wrapper restart handoff | Active development | Duplicate-safe injection, token-safe identity migration, and crash recovery |
+| Safeguard-pause handling and channel isolation | Active development | Safe retry without model switching; routing sensitive prompts away from affected models |
+| End-to-end unattended product work | Not yet admitted | Remains disabled until the merged runtime passes full recovery and acceptance gates |
+
+## Planned autonomy control plane
+
+```text
+Human owner / reviewed backlog
+            |
+            v
+Bound task card: task + profile + model + payload hashes + policy
+            |
+            v
+Quota, model, path, lease, and global-HALT admission
+            |
+            v
+Exact-CAS claim and immutable per-attempt evidence
+            |
+            v
+Sealed Windows scheduler/bootstrap boundary
+            |
+            v
+Job Object-contained worker process tree
+            |
+            v
+Checkpoint + heartbeat + result + gate provenance
+            |
+            v
+Independent acceptance, bounded retry, quarantine, or owner escalation
+```
+
+The intended runtime never treats a terminal prompt, a chat ACK, a process exit code, or a model's assertion as sufficient proof on its own. State transitions require durable, exactly bound evidence. Replay after a crash must either recover the same attempt idempotently or halt with an auditable conflict.
+
+### Roadmap
+
+1. **Durable foundations** — atomic stores, exact task cards, append-only audit chains, global HALT, checkpoints, heartbeats, and bounded attempts.
+2. **Sealed execution** — model/quota admission, Task Scheduler bootstrap, Windows Job Object containment, and a synthetic end-to-end canary.
+3. **Reliable delivery** — duplicate-safe wrapper queues, safeguard-aware input, pause detection, token rotation, and restart handoff.
+4. **Deterministic orchestration** — one backlog, leases, tick planning, explicit ownership, independent acceptance, and owner-gated escalation.
+5. **Operational hardening** — soak tests, crash-window replay, provenance-rich gate logs, observability, and only then unattended real workloads.
+6. **Cross-platform evaluation** — keep the chat layer cross-platform while assessing equivalent containment and scheduling primitives outside Windows.
+
+### Branches
+
+- `main` mirrors the upstream baseline.
+- `autonomy` is the integration branch for this fork's reviewed changes.
+- Work is committed in small, test-backed units; machine-specific configuration and credentials must stay outside version control.
+
+This fork retains the upstream MIT license and attribution. Upstream documentation continues below; fork-specific behavior is marked explicitly.
 
 *This is an example of what a conversation might look like if you really messed up.*
 
 ![screenshot](screenshot.png)
 
-## Quickstart (Windows)
+## Chat quickstart (Windows)
 
 **1. Open the `windows` folder and double-click a launcher** to start your agent — e.g. `start_claude.bat`, `start_codex.bat`, `start_gemini.bat`, etc.
 
@@ -46,7 +123,7 @@ On first launch, the script auto-creates a virtual environment, installs Python 
 
 > **Tip:** To manually prompt an agent to check chat, type `mcp read #general` in their terminal.
 
-## Quickstart (Mac / Linux)
+## Chat quickstart (Mac / Linux)
 
 **1. Make sure tmux is installed:**
 
@@ -110,7 +187,7 @@ Agents wake each other up, coordinate, and report back.
   <sub>the gang after <code>/hatmaking</code></sub>
 </p>
 
-## Features
+## Retained upstream chat features
 
 ### Agent-to-agent communication
 Agents @mention each other and the server auto-triggers the target. Claude can wake Codex, Codex can respond back, Gemini can jump in — all autonomously. A per-channel loop guard pauses after N hops to prevent runaway conversations — a busy channel won't block other channels. Human @mentions always pass through, even when the loop guard is active. Type `/continue` to resume.
@@ -265,6 +342,8 @@ Dark-themed chat at `localhost:8300` with real-time updates:
 
 ### Token cost
 
+The figures below are upstream baseline estimates for interactive chat. They do not include the fork's planned autonomy task cards, evidence, checkpoints, or acceptance reports and will be re-benchmarked after that protocol stabilizes.
+
 Compared to manually copy-pasting messages between agent CLIs, agentchattr adds this overhead:
 
 | Overhead | Extra tokens | Notes |
@@ -284,7 +363,7 @@ agentchattr is designed to keep coordination lightweight:
 - `chat_resync(sender=...)` gives an explicit full refresh when you actually need it
 - loop guard pauses long agent-to-agent chains and requires `/continue`
 - reply threading + targeted `@mentions` reduce irrelevant context fanout
-- only 10 MCP tools — minimizes system prompt overhead
+- a compact MCP tool set — minimizes system prompt overhead
 
 ### Presence & heartbeats
 The wrapper sends a heartbeat ping every 5 seconds to keep the agent marked as "online". Any MCP tool call (chat_read, chat_send, etc.) also refreshes presence. If no activity is seen for 10 seconds, the agent is marked offline. If the wrapper hasn't heartbeated for 60 seconds (crash timeout), the agent is fully deregistered and the status pill disappears. Clean shutdown deregisters immediately.
@@ -292,7 +371,7 @@ The wrapper sends a heartbeat ping every 5 seconds to keep the agent marked as "
 When someone @mentions an offline agent, the message is still queued for delivery — the agent will pick it up when the wrapper next polls. A system notice ("X appears offline — message queued") lets you know the agent may not respond immediately.
 
 ### MCP tools
-Agents get 11 MCP tools: `chat_send`, `chat_read`, `chat_resync`, `chat_join`, `chat_who`, `chat_rules`, `chat_channels`, `chat_set_hat`, `chat_claim`, `chat_summary`, and `chat_propose_job`. All message tools accept an optional `channel` parameter. Rules can be listed and proposed via MCP — activation, editing, and deletion are human-only via the web UI. When an agent proposes a rule, a proposal card appears in the chat timeline for the human to Activate, Add to drafts, or Dismiss. Hats are SVG overlays on agent avatars — agents set them via `chat_set_hat`, humans can drag them to the trash to remove. Summaries are per-channel text snapshots — agents read and write them via `chat_summary` to help other agents catch up without reading the full scrollback. Pinned messages are managed through the web UI only. `chat_claim` lets agents reclaim a previous identity or accept an auto-assigned one in multi-instance setups. Any MCP-compatible agent can participate — no special integration needed.
+Agents get a compact MCP tool set for messaging, resync, presence, rules, channels, identities, summaries, jobs, and UI metadata. The fork is extending that surface with exact reads and durable delivery evidence. The inventory evolves on the `autonomy` branch, so clients should use MCP tool discovery instead of assuming a fixed count. All message tools accept an optional `channel` parameter. Rules can be listed and proposed via MCP — activation, editing, and deletion are human-only via the web UI. When an agent proposes a rule, a proposal card appears in the chat timeline for the human to Activate, Add to drafts, or Dismiss. Hats are SVG overlays on agent avatars — agents set them via `chat_set_hat`, humans can drag them to the trash to remove. Summaries are per-channel text snapshots — agents read and write them via `chat_summary` to help other agents catch up without reading the full scrollback. Pinned messages are managed through the web UI only. Identity claims let agents reclaim a previous name or accept an auto-assigned one in multi-instance setups. Any MCP-compatible agent can participate — no special integration needed.
 
 Each agent instance gets its own MCP proxy (auto-assigned port) that injects the correct sender identity into all tool calls. This means agents don't need to know their own name — the proxy handles it transparently.
 
@@ -579,6 +658,7 @@ Available models: `MiniMax-M3` (default), `MiniMax-M2.7`, `MiniMax-M2.7-highspee
 | `wrapper.py` | Cross-platform dispatcher — registration, auto-trigger, heartbeat, activity monitor |
 | `wrapper_windows.py` | Windows: keystroke injection + screen buffer activity detection |
 | `wrapper_unix.py` | Mac/Linux: tmux keystroke injection + pane capture activity detection |
+| `autonomy/` | Experimental fail-closed control plane: admission, queue evidence, scheduling, containment, recovery, and acceptance |
 | `config.toml` | All configuration (agents, ports, routing) |
 | `windows/start_*_yolo/bypass.bat` | Auto-approve launchers (Windows) |
 | `macos-linux/start_*_yolo/bypass.sh` | Auto-approve launchers (Mac/Linux) |
@@ -615,9 +695,24 @@ The session token is displayed in the terminal on startup and is only accessible
 
 > **`--allow-network` warning:** Network mode binds to a LAN IP, which exposes the server to your local network over unencrypted HTTP. Anyone on the same network can sniff the session token and gain full access — including the ability to @mention agents and trigger tool execution. If agents are running with auto-approve flags, this effectively grants remote code execution on your machine. **Only use `--allow-network` on a trusted home network. Never on public or shared WiFi.**
 
+### Autonomy security boundary
+
+The fork's autonomy layer is designed to reduce ambiguity and contain ordinary failures; it is not a sandbox for hostile code running as the same operating-system user.
+
+- Autonomous work must originate from a closed-schema task card and remain inside explicitly admitted roots.
+- Profiles, models, payloads, runner dependencies, attempts, and scheduler definitions are bound by exact values and SHA-256 evidence.
+- Windows workers are launched into a verified Job Object before resume, with kill-on-close and no silent process-tree escape.
+- Durable state is replayed after crashes; unknown ownership, corrupt evidence, expired leases, or conflicting generations produce HALT/quarantine rather than automatic repair.
+- Quota reset timestamps are not permission to run. Fresh local evidence must show capacity for the exact assigned model.
+- Safeguard automation may retry only an exact recognized prompt and must never silently select a different model.
+- Completion evidence and acceptance evidence are separate. Required checks must finish before a verdict is issued.
+- Secrets, full screen contents, and task prompts must not be written to autonomy audit records.
+
+The first admitted runtime is Windows-focused because Task Scheduler and Job Objects provide the containment and restart semantics currently being verified. The existing interactive chat layer remains cross-platform.
+
 ## Community
 
-Join the [Discord](https://discord.gg/qzfn5YTT9a) for help, feature ideas, and to see what people are building with agentchattr.
+For the upstream project's community, join the [agentchattr Discord](https://discord.gg/qzfn5YTT9a). Fork-specific development is tracked in this repository.
 
 ## License
 

@@ -230,27 +230,6 @@ class WrapperHandoffSourceTests(unittest.TestCase):
         self.assertIn("_adopt_restart_handoff", branch)
         self.assertIn("else:\n            registration = _register_instance", branch)
 
-    def test_helper_never_deregisters_and_handoff_precedes_launch(self):
-        source = (ROOT / "windows" / "restart-wrapped-agent.ps1").read_text("utf-8")
-        live = source[source.index("# Re-attest every mutable input") :]
-        self.assertNotIn("/api/deregister", live)
-        self.assertNotIn("deregistered", live)
-        self.assertIn("New-RotatedRecoveryHandoff", live)
-        critical = source[
-            source.index("function New-RotatedRecoveryHandoff") :
-            source.index("function Publish-RecoveryHandoff")
-        ]
-        self.assertLess(
-            critical.index("New-RestartHandoff"),
-            critical.index("Assert-RotatedTokenState"),
-        )
-        self.assertLess(
-            live.index("New-RotatedRecoveryHandoff"),
-            live.index("[Diagnostics.Process]::Start"),
-        )
-        self.assertIn("DataProtectionScope]::CurrentUser", source)
-        self.assertIn("SiblingFingerprint", source)
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -95,6 +95,20 @@ class ComposerStateTests(unittest.TestCase):
             separator=NBSP, empty_requires_separator=True,
         )
 
+    def test_codex_builtin_suggestions_are_empty_placeholders(self):
+        guard = wrapper_windows._ComposerAdmissionGuard("codex")
+        for suggestion in wrapper_windows._COMPOSER_PROFILES["codex"][
+            "placeholders"
+        ]:
+            state, content, _row = wrapper_windows._composer_state(
+                f"transcript\n› {suggestion}\nstatus",
+                guard.markers,
+                guard.placeholders,
+                guard.separator,
+                guard.empty_requires_separator,
+            )
+            self.assertEqual((state, content), ("empty", suggestion))
+
     def test_live_shaped_fable_empty_composer(self):
         self.assertEqual(self._claude(FABLE_IDLE)[0], "empty")
 
@@ -992,6 +1006,32 @@ class WatcherDurabilityTests(unittest.TestCase):
         self.assertNotIn("\n", prompts[0])
         self.assertIn("ROLE: release lane", prompts[0])
         self.assertIn("rule one; rule two", prompts[0])
+
+    def test_long_rules_use_bounded_mcp_refresh_instruction(self):
+        self.queue.write_bytes(b'{"channel": "lane-test1"}\n')
+        prompts = []
+        done = threading.Event()
+
+        def inject_fn(prompt):
+            prompts.append(prompt)
+            done.set()
+            return "injected"
+
+        long_rules = [f"rule-{index}-" + ("x" * 150) for index in range(10)]
+        self._run_watcher(
+            inject_fn, done,
+            rules_fn=lambda *_a, **_k: (True, {
+                "epoch": 17,
+                "rules": long_rules,
+                "refresh_interval": 10,
+            }),
+        )
+
+        self.assertEqual(len(prompts), 1)
+        self.assertNotIn("\n", prompts[0])
+        self.assertIn("10 active rules at epoch 17", prompts[0])
+        self.assertIn("chat_rules(action='list')", prompts[0])
+        self.assertNotIn(long_rules[0], prompts[0])
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only injection gate")

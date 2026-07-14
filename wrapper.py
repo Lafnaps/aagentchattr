@@ -1383,6 +1383,30 @@ def _capture_identity(get_identity_fn, get_token_fn):
     return name2, queue2, (get_token_fn() if get_token_fn else "")
 
 
+_MAX_INLINE_RULES_CHARS = 640
+
+
+def _rules_prompt_context(rules_data: dict) -> str:
+    """Return bounded rules context suitable for an interactive composer.
+
+    Full active rules remain authoritative. Small sets are carried inline;
+    larger sets use the authenticated MCP endpoint so the prompt stays short
+    enough for the admission guard to verify before pressing Enter.
+    """
+    rules = rules_data.get("rules", [])
+    if not rules:
+        return ""
+    rules_text = "; ".join(str(rule) for rule in rules)
+    if len(rules_text) <= _MAX_INLINE_RULES_CHARS:
+        return "RULES:\n" + rules_text
+    epoch = rules_data.get("epoch", "unknown")
+    return (
+        f"RULES: {len(rules)} active rules at epoch {epoch}. Before acting, "
+        "use MCP chat_rules(action='list') and follow the complete returned "
+        "rule set."
+    )
+
+
 def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = False, trigger_flag=None,
                    server_port: int = 8300, agent_name: str = "", get_token_fn=None,
                    refresh_interval: int = 10, poll_seconds: float = 1.0, stop_event=None,
@@ -1565,9 +1589,9 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                     or (ri > 0 and (trigger_count + 1) % ri == 0)
                 )
                 if need_inject:
-                    if rules_data["rules"]:
-                        rules_text = "; ".join(rules_data["rules"])
-                        prompt += f"\n\nRULES:\n{rules_text}"
+                    rules_context = _rules_prompt_context(rules_data)
+                    if rules_context:
+                        prompt += "\n\n" + rules_context
                     rules_epoch_to_commit = rules_data["epoch"]
 
                 identity_hint_added = False

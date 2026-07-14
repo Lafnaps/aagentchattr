@@ -790,6 +790,19 @@ _COMPOSER_PROFILES: dict[str, dict] = {
         "markers": ("›",),
         "separator": " ",
         "empty_requires_separator": False,
+        # Codex 0.144.x rotates one of these suggestions through an otherwise
+        # empty composer. They are static strings embedded in the CLI binary,
+        # not user-authored input.
+        "placeholders": (
+            "Explain this codebase",
+            "Summarize recent commits",
+            "Implement {feature}",
+            "Find and fix a bug in @filename",
+            "Write tests for @filename",
+            "Improve documentation in @filename",
+            "Run /review on my current changes",
+            "Use /skills to list available skills",
+        ),
     },
 }
 
@@ -941,7 +954,10 @@ class _ComposerAdmissionGuard:
             self.empty_requires_separator = bool(
                 profile.get("empty_requires_separator", False)
             )
-        self.placeholders = tuple(placeholders or ())
+        self.placeholders = tuple(
+            placeholders if placeholders is not None
+            else profile.get("placeholders", ())
+        )
         self.stable_reads = max(2, int(stable_reads))
         self._last_screen = None
         self._last_row = -1

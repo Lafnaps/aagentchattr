@@ -103,11 +103,11 @@ class ConfigOverrideTests(unittest.TestCase):
         self.assertEqual(config["images"]["upload_dir"], abs_uploads)
 
     def test_agents_section_unchanged_by_overrides(self):
+        expected_agents = config_loader.load_config(ROOT)["agents"]
         os.environ["AGENTCHATTR_PORT"] = "8310"
         config = config_loader.load_config(ROOT)
         # Agent definitions must be untouched by path/port overrides
-        self.assertIn("claude", config["agents"])
-        self.assertEqual(config["agents"]["claude"]["command"], "claude")
+        self.assertEqual(config["agents"], expected_agents)
 
 
 class CliOverrideExtractionTests(unittest.TestCase):

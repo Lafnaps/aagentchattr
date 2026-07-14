@@ -110,17 +110,19 @@ class McpBridgeAuthTests(unittest.TestCase):
 
         self.assertIn("authenticated agent session required", result)
 
-    def test_stale_token_is_rejected_after_deregister(self):
+    def test_deregistered_token_reactivates_session(self):
         inst = self.registry.register("codex")
         self.registry.deregister(inst["name"])
 
         result = mcp_bridge.chat_send(
             sender=inst["name"],
-            message="stale",
+            message="resumed",
             ctx=auth_ctx(inst["token"]),
         )
 
-        self.assertIn("stale or unknown authenticated agent session", result)
+        self.assertIn("Sent", result)
+        self.assertTrue(self.registry.is_registered(inst["name"]))
+        self.assertEqual(self.store.get_recent(1)[0]["sender"], inst["name"])
 
     def test_chat_read_exact_survives_more_than_twenty_later_messages(self):
         inst = self.registry.register("codex")

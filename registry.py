@@ -8,10 +8,12 @@ Thread-safe: a single threading.Lock guards all mutations.
 
 import colorsys
 import json
+import os
 import secrets
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -36,6 +38,12 @@ class RuntimeRegistry:
 
     def __init__(self, data_dir: str = "./data"):
         self._lock = threading.Lock()
+        # Serializes the whole snapshot→write→replace of registry.json so a
+        # rotation's durable persist cannot be reordered behind a stale snapshot
+        # (id1097 B2). Lock order is ALWAYS _persist_lock before _lock; every
+        # save is invoked outside _lock, so there is no inversion/deadlock.
+        self._persist_lock = threading.Lock()
+        self._renames_persist_lock = threading.Lock()
         self._bases: dict[str, dict] = {}          # base name → config template
         self._instances: dict[str, Instance] = {}   # canonical name → Instance
         self._reserved: dict[str, float] = {}       # name → deregister timestamp
@@ -43,6 +51,7 @@ class RuntimeRegistry:
         self._reclaimable: dict[str, Instance] = {}  # name → deregistered Instance, recoverable on reconnect
         self._on_change_cbs: list = []
         self._data_dir = Path(data_dir)
+        self._migration_leases = None
         self._load_renames()
         self._load_instances()
 
@@ -57,6 +66,50 @@ class RuntimeRegistry:
     def on_change(self, cb):
         """Register a callback fired after any registry mutation."""
         self._on_change_cbs.append(cb)
+
+    def attach_migration_leases(self, lease_store):
+        """Attach the topology guard used by crash-safe wrapper migrations.
+
+        The lease lock always precedes ``_lock``.  Keeping this dependency
+        optional preserves the standalone registry contract used by tools and
+        older tests.
+        """
+        self._migration_leases = lease_store
+
+    @contextmanager
+    def _topology_lock(self):
+        leases = self._migration_leases
+        if leases is None:
+            with self._lock:
+                yield
+            return
+        with leases.locked():
+            with self._lock:
+                yield
+
+    def _family_migration_leased_locked(self, base: str) -> bool:
+        leases = self._migration_leases
+        return bool(leases and leases.is_family_held_locked(base))
+
+    def _family_migration_block_locked(self, base: str) -> str | None:
+        leases = self._migration_leases
+        if leases is None:
+            return None
+        if not leases.healthy:
+            return "migration_lease_store_unhealthy"
+        if leases.is_family_held_locked(base):
+            return "migration_lease_active"
+        return None
+
+    def _route_migration_block_locked(self, *names: str) -> str | None:
+        leases = self._migration_leases
+        if leases is None:
+            return None
+        if not leases.healthy:
+            return "migration_lease_store_unhealthy"
+        if any(leases.is_route_name_held_locked(name) for name in names):
+            return "migration_lease_route_active"
+        return None
 
     def _notify(self):
         for cb in self._on_change_cbs:
@@ -80,39 +133,98 @@ class RuntimeRegistry:
 
     def _save_renames(self):
         """Persist renames to disk. Must be called outside the lock."""
+        with self._renames_persist_lock:
+            try:
+                with self._lock:
+                    data = dict(self._renames)
+                self._write_renames_snapshot_to_disk(data)
+            except Exception:
+                pass
+
+    def _write_renames_snapshot_to_disk(self, data: dict):
+        """Atomically persist a caller-owned rename snapshot; raises on error."""
+        self._data_dir.mkdir(parents=True, exist_ok=True)
+        tmp = self._renames_path().with_suffix(".tmp")
         try:
-            self._data_dir.mkdir(parents=True, exist_ok=True)
-            tmp = self._renames_path().with_suffix(".tmp")
-            with self._lock:
-                data = dict(self._renames)
-            tmp.write_text(json.dumps(data), "utf-8")
-            tmp.replace(self._renames_path())
+            with tmp.open("w", encoding="utf-8", newline="") as handle:
+                handle.write(json.dumps(data))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self._renames_path())
+            _fsync_directory(self._data_dir)
         except Exception:
-            pass
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
 
     # --- Instance persistence (survives server restart) ---
 
     def _instances_path(self) -> Path:
         return self._data_dir / "registry.json"
 
+    def _snapshot_data_locked(self) -> dict:
+        """Build the persistable registry snapshot. Caller MUST hold _lock."""
+        return {
+            "instances": {n: _inst_full(i) for n, i in self._instances.items()},
+            "reclaimable": {n: _inst_full(i) for n, i in self._reclaimable.items()},
+        }
+
+    def _write_snapshot_to_disk(self, data: dict):
+        """Durable snapshot→tmp→replace of registry.json; RAISES on failure.
+
+        Pure I/O, takes NO lock — the caller owns serialization. rotate_token
+        calls this while holding BOTH _persist_lock and _lock so the whole
+        swap→snapshot→write→replace→rollback is atomic to any observer (id1142
+        BLOCKER #1: a concurrent resolve_token(old) blocks on _lock until the
+        rotation commits or fully rolls back, so a failed rotation is a true
+        atomic no-op — old never transiently invalid).
+        """
+        self._data_dir.mkdir(parents=True, exist_ok=True)
+        tmp = self._instances_path().with_suffix(".tmp")
+        try:
+            with tmp.open("w", encoding="utf-8", newline="") as handle:
+                handle.write(json.dumps(data))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self._instances_path())
+            _fsync_directory(self._data_dir)
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+
+    def _write_instances_snapshot(self):
+        """Serialized snapshot→write→replace of registry.json; RAISES on failure.
+
+        Held under _persist_lock so the snapshot taken here and the replace that
+        publishes it are one atomic step relative to every other save: two
+        concurrent saves can never let an older snapshot land after a newer one
+        (id1097 B2). The best-effort callers do not need cross-observer atomicity,
+        so the snapshot is taken under _lock and the I/O runs after releasing it.
+        Must be called while holding _persist_lock and NOT while holding _lock.
+        """
+        with self._lock:
+            data = self._snapshot_data_locked()
+        self._write_snapshot_to_disk(data)
+
     def _save_instances(self):
-        """Persist live + reclaimable instances (incl. tokens) to disk.
+        """Best-effort persist of live + reclaimable instances (incl. tokens).
 
         Tokens live in the local ./data dir, consistent with the existing local-only
-        posture (server binds 127.0.0.1). Must be called outside the lock.
+        posture (server binds 127.0.0.1). Serialized through _persist_lock so it
+        shares the same ordering guarantee as the strict writer; swallows failures
+        for the fire-and-forget callers (register/deregister/claim/…). Rotation
+        does NOT use this path — it needs the failure signal. Call outside _lock.
         """
-        try:
-            self._data_dir.mkdir(parents=True, exist_ok=True)
-            with self._lock:
-                data = {
-                    "instances": {n: _inst_full(i) for n, i in self._instances.items()},
-                    "reclaimable": {n: _inst_full(i) for n, i in self._reclaimable.items()},
-                }
-            tmp = self._instances_path().with_suffix(".tmp")
-            tmp.write_text(json.dumps(data), "utf-8")
-            tmp.replace(self._instances_path())
-        except Exception:
-            pass
+        with self._persist_lock:
+            try:
+                self._write_instances_snapshot()
+            except Exception:
+                pass
 
     def _load_instances(self):
         p = self._instances_path()
@@ -177,21 +289,30 @@ class RuntimeRegistry:
         """
         live_names = set(self._instances.keys())
         live_coords = {(i.base, i.slot) for i in self._instances.values()}
-        for rn in [rn for rn, ri in self._reclaimable.items()
-                   if rn in live_names or (ri.base, ri.slot) in live_coords]:
+        for rn, ri in list(self._reclaimable.items()):
+            if rn not in live_names and (ri.base, ri.slot) not in live_coords:
+                continue
+            # A healthy held lease owns its exact coordinate; an unhealthy
+            # store freezes all eviction because the protected identity cannot
+            # be determined safely.
+            leases = self._migration_leases
+            if leases and leases.is_family_held_locked(ri.base):
+                continue
             del self._reclaimable[rn]
 
     # --- Registration ---
 
-    def register(self, base: str, label: str | None = None) -> dict | None:
+    def register(self, base: str, label: str | None = None) -> dict | str | None:
         """Register a new instance of `base`. Returns slot info or None if unknown base.
 
         When a 2nd instance registers, slot 1 is renamed from 'base' to 'base-1'
         to prevent identity ambiguity. The rename info is returned as '_renamed_slot1'.
         """
-        with self._lock:
+        with self._topology_lock():
             if base not in self._bases:
                 return None
+            if migration_block := self._family_migration_block_locked(base):
+                return migration_block
 
             self._expire_reserved()
 
@@ -206,6 +327,13 @@ class RuntimeRegistry:
             slot = 1
             while slot in taken or slot in reserved:
                 slot += 1
+
+            prospective_name = base if slot == 1 else f"{base}-{slot}"
+            route_names = [prospective_name]
+            if slot >= 2 and base in self._instances:
+                route_names.append(f"{base}-1")
+            if route_block := self._route_migration_block_locked(*route_names):
+                return route_block
 
             # When a 2nd instance registers, rename slot-1 from "base" to "base-1"
             # so that no instance shares a name with the base family.  This prevents
@@ -260,10 +388,24 @@ class RuntimeRegistry:
         Returns result dict with 'ok' and optional '_renamed_back' info,
         or None if instance not found.
         """
-        with self._lock:
+        with self._topology_lock():
             if name not in self._instances:
                 return None
             inst_removed = self._instances[name]
+            if migration_block := self._family_migration_block_locked(inst_removed.base):
+                return {
+                    "ok": False,
+                    "error": migration_block,
+                }
+            family_before = [
+                inst for inst in self._instances.values()
+                if inst.base == inst_removed.base and inst.name != name
+            ]
+            route_names = [name]
+            if len(family_before) == 1 and family_before[0].name != inst_removed.base:
+                route_names.append(inst_removed.base)
+            if route_block := self._route_migration_block_locked(*route_names):
+                return {"ok": False, "error": route_block}
             base = inst_removed.base
             del self._instances[name]
             self._reserved[name] = time.time()
@@ -314,8 +456,17 @@ class RuntimeRegistry:
         """
         error = None
         result = None
-        with self._lock:
+        with self._topology_lock():
             # Recover a reclaimable identity (e.g. deregistered by crash-timeout during sleep)
+            if sender not in self._instances:
+                dormant = self._reclaimable.get(sender)
+                sender_base = dormant.base if dormant else self._parse_name(sender)[0]
+                if migration_block := self._family_migration_block_locked(sender_base):
+                    return migration_block
+            if target_name and (
+                route_block := self._route_migration_block_locked(sender, target_name)
+            ):
+                return route_block
             self._restore_reclaimable_locked(sender, target_name)
             inst = None
 
@@ -340,6 +491,11 @@ class RuntimeRegistry:
 
             if not inst:
                 error = f"No available {sender} instance. Is a wrapper registered?"
+            elif (
+                inst.state != "active"
+                and (migration_block := self._family_migration_block_locked(inst.base))
+            ):
+                error = migration_block
             elif target_name is None or target_name == inst.name:
                 # Accept current name — but don't auto-activate pending instances.
                 # Pending instances must be named by human (lightbox) or reclaimed
@@ -351,7 +507,13 @@ class RuntimeRegistry:
                     result = _inst_dict(inst)
             else:
                 # Rename/reclaim — check collision and family guard
-                if target_name in self._instances and target_name != inst.name:
+                if migration_block := self._family_migration_block_locked(inst.base):
+                    error = migration_block
+                elif route_block := self._route_migration_block_locked(
+                    inst.name, target_name
+                ):
+                    error = route_block
+                elif target_name in self._instances and target_name != inst.name:
                     error = f"Already claimed: {target_name}"
                 elif (family_err := self._conflicts_with_other_family(target_name, inst.base)):
                     error = family_err
@@ -404,9 +566,11 @@ class RuntimeRegistry:
 
     def confirm_pending(self, name: str) -> bool:
         """Auto-confirm a pending instance (10s timeout path)."""
-        with self._lock:
+        with self._topology_lock():
             inst = self._instances.get(name)
             if not inst or inst.state != "pending":
+                return False
+            if self._family_migration_block_locked(inst.base):
                 return False
             inst.state = "active"
 
@@ -423,10 +587,19 @@ class RuntimeRegistry:
         Changes the sender ID, label, and tracks the rename for wrapper sync.
         If new_name == old_name, falls back to a label-only change.
         """
-        with self._lock:
+        with self._topology_lock():
             inst = self._instances.get(old_name)
             if not inst:
                 return f"Not found: {old_name}"
+
+            if new_name != old_name and (
+                migration_block := self._family_migration_block_locked(inst.base)
+            ):
+                return migration_block
+            if new_name != old_name and (
+                route_block := self._route_migration_block_locked(old_name, new_name)
+            ):
+                return route_block
 
             if new_name == old_name:
                 # Same identity — just update label
@@ -633,18 +806,22 @@ class RuntimeRegistry:
         result = None
         reactivated = False
         changed = False
-        with self._lock:
+        with self._topology_lock():
             for inst in self._instances.values():
                 if inst.token == token:
                     return _inst_dict(inst)
             for name, inst in list(self._reclaimable.items()):
                 if inst.token != token or name in self._instances:
                     continue
+                if self._family_migration_block_locked(inst.base):
+                    continue
                 # Fresh-wins guard: if a live instance already holds this (base, slot),
                 # the token is stale (its identity was superseded by a fresh launch or a
                 # rename-back). Drop it rather than reviving a colliding second instance.
                 if any(li.base == inst.base and li.slot == inst.slot
                        for li in self._instances.values()):
+                    if self._family_migration_leased_locked(inst.base):
+                        continue
                     del self._reclaimable[name]
                     changed = True
                     continue
@@ -661,6 +838,53 @@ class RuntimeRegistry:
         if changed:
             self._save_instances()
         return result
+
+    def rotate_token(self, old_token: str) -> dict | str | None:
+        """Durably replace the token of the live ACTIVE instance owning `old_token`.
+
+        Wrapper-restart prerequisite: an exposed bearer is retired by the wrapper
+        itself before deregistration. Auth is by possession — the instance is
+        located ONLY by the presented token, never by a caller-supplied name.
+        Deliberately does NOT use resolve_token: that call transparently
+        reactivates reclaimable identities, and a dormant (reclaimable) or
+        pending token must never mint a fresh credential here — fail-closed None.
+
+        DURABILITY + ATOMICITY (id1097 B1/B2, id1142 BLOCKER #1): the whole
+        find→swap→snapshot→write→replace→rollback runs while holding _lock
+        (under _persist_lock for cross-save ordering). The writer does NOT
+        reacquire _lock — it snapshots via _snapshot_data_locked() and writes
+        via _write_snapshot_to_disk() with the lock still held. A concurrent
+        resolve_token(old) therefore blocks on _lock until the rotation either
+        commits (old now stale) or fully rolls back (old still valid) — it can
+        never observe the intermediate "old swapped out but not yet persisted"
+        state, so a failed rotation is a true atomic no-op. On success the old
+        token is stale and the disk holds the new token (survives restart).
+        Returns {"name","token"} on success, "persist-failed" on save error,
+        or None when the token is not a live-active credential.
+        """
+        with self._persist_lock:
+            with self._lock:
+                target = None
+                for inst in self._instances.values():
+                    if inst.token == old_token:
+                        target = inst
+                        break
+                if target is None or target.state != "active":
+                    return None
+                new_token = secrets.token_hex(16)
+                target.token = new_token
+                name = target.name
+                try:
+                    # Snapshot + durable write WHILE holding _lock so no observer
+                    # sees the half-applied rotation. I/O under the lock is
+                    # acceptable: rotation is rare and correctness dominates.
+                    self._write_snapshot_to_disk(self._snapshot_data_locked())
+                except Exception:
+                    # Roll back the in-memory swap before releasing _lock, so the
+                    # old (still-on-disk) token stays continuously valid.
+                    target.token = old_token
+                    return "persist-failed"
+        return {"name": name, "token": new_token}
 
     def get_pending(self) -> list[dict]:
         """All pending instances (for timeout checks)."""
@@ -696,9 +920,29 @@ class RuntimeRegistry:
                 pass
         return name, 1
 
-    def clean_renames_for(self, name: str):
+    def clean_renames_for(self, name: str) -> bool:
         """Remove all rename chain entries pointing to or from `name`."""
-        with self._lock:
+        with self._topology_lock():
+            # Follow both directions through the persisted route graph.  A
+            # custom historical alias may not parse back to its base, but it is
+            # still protected when its chain reaches a leased family member.
+            related = {name}
+            changed = True
+            while changed:
+                changed = False
+                for old, new in self._renames.items():
+                    if old in related or new in related:
+                        before = len(related)
+                        related.update((old, new))
+                        changed = changed or len(related) != before
+            for related_name in related:
+                inst = (
+                    self._instances.get(related_name)
+                    or self._reclaimable.get(related_name)
+                )
+                base = inst.base if inst else self._parse_name(related_name)[0]
+                if self._family_migration_leased_locked(base):
+                    return False
             # Remove entries where name is a key (old name → ...)
             self._renames.pop(name, None)
             # Remove entries where name is a value (... → name)
@@ -706,6 +950,7 @@ class RuntimeRegistry:
             for k in stale:
                 del self._renames[k]
         self._save_renames()
+        return True
 
     def _expire_reserved(self):
         """Remove expired reservations. Must hold lock."""
@@ -715,6 +960,21 @@ class RuntimeRegistry:
 
 
 # --- Module-level helpers ---
+
+def _fsync_directory(path: Path):
+    """Best-effort directory fsync after atomic snapshot replacement."""
+    try:
+        directory_fd = os.open(
+            str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        # Windows has no portable directory fsync; file fsync still applies.
+        pass
+
 
 def _inst_dict(inst: Instance, include_token: bool = False) -> dict:
     d = {

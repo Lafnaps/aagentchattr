@@ -132,6 +132,49 @@ def build_export(store, jobs_store, rules_store, summary_store,
 # Import
 # ---------------------------------------------------------------------------
 
+def inspect_archive_channels(zip_bytes: bytes) -> tuple[list[object], str | None]:
+    """Return first-seen channel values without mutating any destination store."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    except zipfile.BadZipFile:
+        return [], "invalid zip archive"
+
+    channels: list[object] = []
+    seen: set[tuple[type, str]] = set()
+
+    def remember(value):
+        if value is None or value == "":
+            value = "general"
+        key = (type(value), repr(value))
+        if key not in seen:
+            seen.add(key)
+            channels.append(value)
+
+    if "messages.jsonl" in zf.namelist():
+        raw = zf.read("messages.jsonl").decode("utf-8", errors="replace")
+        for line in raw.splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                remember(record.get("channel", "general"))
+
+    for filename in ("jobs.json", "summaries.json"):
+        if filename not in zf.namelist():
+            continue
+        try:
+            records = json.loads(zf.read(filename))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(records, list):
+            for record in records:
+                if isinstance(record, dict):
+                    remember(record.get("channel", "general"))
+
+    return channels, None
+
+
 def import_archive(zip_bytes: bytes, store, jobs_store, rules_store,
                    summary_store, channel_list: list[str],
                    max_channels: int = 8) -> dict:
@@ -372,11 +415,9 @@ def _do_import(zip_bytes, store, jobs_store, rules_store,
                 text=rule.get("text", ""),
                 author=rule.get("author", "import"),
                 reason=rule.get("reason", ""),
+                uid=rule_uid,
             )
             if new_rule:
-                # Patch uid onto the rule record and save
-                new_rule["uid"] = rule_uid
-                rules_store._save()
                 # Restore status if not pending — patch directly to avoid
                 # state machine transition guards (e.g. deactivate only works
                 # from active/proposed/draft, not pending)

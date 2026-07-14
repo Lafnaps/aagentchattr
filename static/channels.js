@@ -101,7 +101,7 @@ function renderChannelTabs() {
     // Update add button disabled state
     const addBtn = document.getElementById('channel-add-btn');
     if (addBtn) {
-        addBtn.classList.toggle('disabled', window.channelList.length >= 8);
+        addBtn.classList.toggle('disabled', window.channelList.length >= window.maxChannels);
     }
 
     renderChannelSidebar();
@@ -168,7 +168,7 @@ function renderChannelSidebar() {
 
     const addBtn = document.getElementById('channel-sidebar-add');
     if (addBtn) {
-        addBtn.classList.toggle('disabled', window.channelList.length >= 8);
+        addBtn.classList.toggle('disabled', window.channelList.length >= window.maxChannels);
     }
 }
 
@@ -323,12 +323,30 @@ function filterMessagesByChannel() {
     }
 }
 
+/**
+ * Make a channel from an incoming message visible immediately.
+ *
+ * The server persists and broadcasts the authoritative catalogue. This is a
+ * client-side event-ordering fallback for the narrow case where a message
+ * frame is observed before its settings frame.
+ */
+function ensureChannelDiscovered(name, revision = window.catalogueRevision || 0) {
+    if (typeof name !== 'string' || !/^[a-z0-9][a-z0-9\-]{0,19}$/.test(name)) return false;
+    if (revision < (window.catalogueRevision || 0)) return false;
+    if (window.channelList.includes(name)) return false;
+    window.channelList = [...window.channelList, name];
+    if (window.channelUnread[name] === undefined) window.channelUnread[name] = 0;
+    renderChannelTabs();
+    return true;
+}
+window.ensureChannelDiscovered = ensureChannelDiscovered;
+
 // ---------------------------------------------------------------------------
 // Create
 // ---------------------------------------------------------------------------
 
 function showChannelCreateDialog() {
-    if (window.channelList.length >= 8) return;
+    if (window.channelList.length >= window.maxChannels) return;
     // Route the inline create into the sidebar list when sidebar mode is on,
     // otherwise into the top-bar tabs — keeps the input visible either way.
     const inSidebar = document.body.classList.contains('channels-in-sidebar');

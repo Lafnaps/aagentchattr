@@ -1,11 +1,49 @@
 """Schedule store — recurring prompts fired without human intervention."""
 
+import copy
 import json
+import os
 import re
+import tempfile
 import time
 import threading
 import uuid
 from pathlib import Path
+
+
+def _atomic_write_text(path: Path, content: str):
+    """Replace *path* atomically after flushing file contents."""
+    fd = None
+    temp_path: Path | None = None
+    try:
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+        )
+        temp_path = Path(temp_name)
+        stream = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        fd = None
+        with stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 # Interval parsing: "every 30m", "every 1h", "every 2h", "daily at 09:00"
@@ -105,9 +143,9 @@ class ScheduleStore:
             self._schedules = []
 
     def _save(self):
-        self._path.write_text(
+        _atomic_write_text(
+            self._path,
             json.dumps(self._schedules, indent=2, ensure_ascii=False) + "\n",
-            "utf-8",
         )
 
     def on_change(self, callback):
@@ -123,7 +161,7 @@ class ScheduleStore:
 
     def list_all(self, active_only: bool = False) -> list[dict]:
         with self._lock:
-            result = list(self._schedules)
+            result = copy.deepcopy(self._schedules)
         if active_only:
             result = [s for s in result if s.get("active", True)]
         return result
@@ -132,7 +170,7 @@ class ScheduleStore:
         with self._lock:
             for s in self._schedules:
                 if s.get("id") == schedule_id:
-                    return dict(s)
+                    return copy.deepcopy(s)
             return None
 
     def create(
@@ -179,16 +217,24 @@ class ScheduleStore:
                 "created_by": created_by,
             }
             self._schedules.append(s)
-            self._save()
-        self._fire("create", s)
-        return dict(s)
+            try:
+                self._save()
+            except Exception:
+                self._schedules.pop()
+                raise
+        result = copy.deepcopy(s)
+        self._fire("create", result)
+        return result
 
     def run_due(self) -> list[dict]:
         """Return list of schedules that are due (next_run <= now). Does not update."""
         now = time.time()
         with self._lock:
-            due = [s for s in self._schedules if s.get("active") and s.get("next_run", 0) <= now]
-        return [dict(s) for s in due]
+            due = [
+                s for s in self._schedules
+                if s.get("active") and s.get("next_run", 0) <= now
+            ]
+            return copy.deepcopy(due)
 
     def mark_run(self, schedule_id: str) -> dict | None:
         """Mark schedule as run, advance next_run. Returns updated schedule."""
@@ -196,6 +242,7 @@ class ScheduleStore:
             for s in self._schedules:
                 if s.get("id") != schedule_id:
                     continue
+                previous = copy.deepcopy(s)
                 now = time.time()
                 s["last_run"] = now
                 s["next_run"] = compute_next_run(
@@ -203,8 +250,13 @@ class ScheduleStore:
                     now,
                     daily_at=s.get("daily_at"),
                 )
-                self._save()
-                result = dict(s)
+                try:
+                    self._save()
+                except Exception:
+                    s.clear()
+                    s.update(previous)
+                    raise
+                result = copy.deepcopy(s)
                 break
             else:
                 return None
@@ -216,8 +268,12 @@ class ScheduleStore:
             for i, s in enumerate(self._schedules):
                 if s.get("id") == schedule_id:
                     removed = self._schedules.pop(i)
-                    self._save()
-                    result = dict(removed)
+                    try:
+                        self._save()
+                    except Exception:
+                        self._schedules.insert(i, removed)
+                        raise
+                    result = copy.deepcopy(removed)
                     break
             else:
                 return None
@@ -228,9 +284,15 @@ class ScheduleStore:
         with self._lock:
             for s in self._schedules:
                 if s.get("id") == schedule_id:
+                    previous = copy.deepcopy(s)
                     s["active"] = not s.get("active", True)
-                    self._save()
-                    result = dict(s)
+                    try:
+                        self._save()
+                    except Exception:
+                        s.clear()
+                        s.update(previous)
+                        raise
+                    result = copy.deepcopy(s)
                     break
             else:
                 return None

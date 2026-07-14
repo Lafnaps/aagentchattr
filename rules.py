@@ -1,10 +1,63 @@
 """Rules store — shared working style for agents. Agents propose, humans approve."""
 
+import copy
 import json
+import os
+import tempfile
 import time
 import threading
 import uuid
 from pathlib import Path
+
+
+def _atomic_write_text(path: Path, content: str):
+    """Replace *path* atomically after flushing file contents."""
+    fd = None
+    temp_path: Path | None = None
+    try:
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+        )
+        temp_path = Path(temp_name)
+        stream = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        fd = None
+        with stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+def _file_snapshot(path: Path) -> tuple[bool, bytes]:
+    return (True, path.read_bytes()) if path.exists() else (False, b"")
+
+
+def _restore_file_snapshot(path: Path, snapshot: tuple[bool, bytes]):
+    existed, content = snapshot
+    if existed:
+        _atomic_write_text(path, content.decode("utf-8"))
+    else:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
 
 MAX_ACTIVE_RULES = 10
 MAX_TEXT_CHARS = 160
@@ -20,7 +73,7 @@ class RuleStore:
         self._next_id = 1
         self._epoch = 0
         self._agent_sync: dict[str, int] = {}  # agent_name -> last_epoch_seen
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._callbacks: list = []
         self._load()
 
@@ -65,9 +118,9 @@ class RuleStore:
             "epoch": self._epoch,
             "rules": self._rules,
         }
-        self._path.write_text(
+        _atomic_write_text(
+            self._path,
             json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-            "utf-8",
         )
 
     def on_change(self, callback):
@@ -90,13 +143,13 @@ class RuleStore:
 
     def list_all(self) -> list[dict]:
         with self._lock:
-            return list(self._rules)
+            return copy.deepcopy(self._rules)
 
     def get(self, rule_id: int) -> dict | None:
         with self._lock:
             for r in self._rules:
                 if r["id"] == rule_id:
-                    return dict(r)
+                    return copy.deepcopy(r)
             return None
 
     def active_list(self) -> dict:
@@ -110,86 +163,153 @@ class RuleStore:
 
     @property
     def epoch(self) -> int:
-        return self._epoch
+        with self._lock:
+            return self._epoch
+
+    def snapshot_state(self) -> dict:
+        """Capture exact durable rule state for a cross-store transaction."""
+        with self._lock:
+            return {
+                "rules": copy.deepcopy(self._rules),
+                "next_id": self._next_id,
+                "epoch": self._epoch,
+                "file": _file_snapshot(self._path),
+            }
+
+    def restore_state(self, snapshot: dict):
+        """Restore a prior snapshot atomically, or retain the current state."""
+        with self._lock:
+            current = self.snapshot_state()
+            self._rules = copy.deepcopy(snapshot["rules"])
+            self._next_id = snapshot["next_id"]
+            self._epoch = snapshot["epoch"]
+            try:
+                _restore_file_snapshot(self._path, snapshot["file"])
+            except Exception:
+                self._rules = current["rules"]
+                self._next_id = current["next_id"]
+                self._epoch = current["epoch"]
+                try:
+                    _restore_file_snapshot(self._path, current["file"])
+                except Exception:
+                    pass
+                raise
 
     # --- Writes ---
 
-    def propose(self, text: str, author: str, reason: str = "") -> dict | None:
+    def propose(self, text: str, author: str, reason: str = "",
+                uid: str | None = None) -> dict | None:
         with self._lock:
             total = len(self._rules)
             if total >= 50:  # generous total cap including all states
                 return None
             r = {
                 "id": self._next_id,
-                "uid": str(uuid.uuid4()),
+                "uid": uid or str(uuid.uuid4()),
                 "text": text.strip()[:MAX_TEXT_CHARS],
                 "author": author.strip(),
                 "reason": reason.strip()[:MAX_REASON_CHARS],
                 "status": "pending",
                 "created_at": time.time(),
             }
+            previous_next_id = self._next_id
             self._next_id += 1
             self._rules.append(r)
-            self._save()
-        self._fire("propose", r)
-        return r
+            try:
+                self._save()
+            except Exception:
+                self._rules.pop()
+                self._next_id = previous_next_id
+                raise
+        result = copy.deepcopy(r)
+        self._fire("propose", result)
+        return result
 
-    def activate(self, rule_id: int) -> dict | None:
+    def activate(self, rule_id: int, *, _notify: bool = True) -> dict | None:
         with self._lock:
             active_count = sum(1 for r in self._rules if r.get("status") == "active")
             if active_count >= MAX_ACTIVE_RULES:
                 return None
             for r in self._rules:
                 if r["id"] == rule_id:
+                    previous = copy.deepcopy(r)
+                    previous_epoch = self._epoch
                     r["status"] = "active"
                     self._bump_epoch()
-                    self._save()
-                    result = dict(r)
+                    try:
+                        self._save()
+                    except Exception:
+                        r.clear()
+                        r.update(previous)
+                        self._epoch = previous_epoch
+                        raise
+                    result = copy.deepcopy(r)
                     break
             else:
                 return None
-        self._fire("activate", result)
+        if _notify:
+            self._fire("activate", result)
         return result
 
-    def make_draft(self, rule_id: int) -> dict | None:
+    def make_draft(self, rule_id: int, *, _notify: bool = True) -> dict | None:
         with self._lock:
             for r in self._rules:
                 if r["id"] == rule_id:
+                    previous = copy.deepcopy(r)
+                    previous_epoch = self._epoch
                     was_active = r.get("status") == "active"
                     r["status"] = "draft"
                     r.pop("archived_at", None)
                     if was_active:
                         self._bump_epoch()
-                    self._save()
-                    result = dict(r)
+                    try:
+                        self._save()
+                    except Exception:
+                        r.clear()
+                        r.update(previous)
+                        self._epoch = previous_epoch
+                        raise
+                    result = copy.deepcopy(r)
                     break
             else:
                 return None
-        self._fire("edit", result)
+        if _notify:
+            self._fire("edit", result)
         return result
 
-    def deactivate(self, rule_id: int) -> dict | None:
+    def deactivate(self, rule_id: int, *, _notify: bool = True) -> dict | None:
         with self._lock:
             for r in self._rules:
                 if r["id"] == rule_id and r.get("status") in ("active", "proposed", "draft"):
+                    previous = copy.deepcopy(r)
+                    previous_epoch = self._epoch
                     was_active = r.get("status") == "active"
                     r["status"] = "archived"
                     r["archived_at"] = time.time()
                     if was_active:
                         self._bump_epoch()
-                    self._save()
-                    result = dict(r)
+                    try:
+                        self._save()
+                    except Exception:
+                        r.clear()
+                        r.update(previous)
+                        self._epoch = previous_epoch
+                        raise
+                    result = copy.deepcopy(r)
                     break
             else:
                 return None
-        self._fire("deactivate", result)
+        if _notify:
+            self._fire("deactivate", result)
         return result
 
     def edit(self, rule_id: int, text: str | None = None,
-             reason: str | None = None) -> dict | None:
+             reason: str | None = None, *, _notify: bool = True) -> dict | None:
         with self._lock:
             for r in self._rules:
                 if r["id"] == rule_id:
+                    previous = copy.deepcopy(r)
+                    previous_epoch = self._epoch
                     was_active = r.get("status") == "active"
                     if text is not None:
                         r["text"] = text.strip()[:MAX_TEXT_CHARS]
@@ -197,28 +317,42 @@ class RuleStore:
                         r["reason"] = reason.strip()[:MAX_REASON_CHARS]
                     if was_active:
                         self._bump_epoch()
-                    self._save()
-                    result = dict(r)
+                    try:
+                        self._save()
+                    except Exception:
+                        r.clear()
+                        r.update(previous)
+                        self._epoch = previous_epoch
+                        raise
+                    result = copy.deepcopy(r)
                     break
             else:
                 return None
-        self._fire("edit", result)
+        if _notify:
+            self._fire("edit", result)
         return result
 
-    def delete(self, rule_id: int) -> dict | None:
+    def delete(self, rule_id: int, *, _notify: bool = True) -> dict | None:
         with self._lock:
             for i, r in enumerate(self._rules):
                 if r["id"] == rule_id:
                     was_active = r.get("status") == "active"
+                    previous_epoch = self._epoch
                     removed = self._rules.pop(i)
                     if was_active:
                         self._bump_epoch()
-                    self._save()
-                    result = dict(removed)
+                    try:
+                        self._save()
+                    except Exception:
+                        self._rules.insert(i, removed)
+                        self._epoch = previous_epoch
+                        raise
+                    result = copy.deepcopy(removed)
                     break
             else:
                 return None
-        self._fire("delete", result)
+        if _notify:
+            self._fire("delete", result)
         return result
 
     # --- Remind ---
@@ -226,7 +360,13 @@ class RuleStore:
     def set_remind(self):
         """Bump epoch so all agents re-inject rules on next trigger."""
         with self._lock:
+            previous_epoch = self._epoch
             self._bump_epoch()
+            try:
+                self._save()
+            except Exception:
+                self._epoch = previous_epoch
+                raise
 
     def clear_remind(self):
         """No-op — remind is now epoch-based, not flag-based."""

@@ -39,5 +39,44 @@ class RouterMentionTests(unittest.TestCase):
         self.assertEqual(router.get_targets("ben", "@telegram-bot check"), [])
 
 
+class RouterLoopGuardTests(unittest.TestCase):
+    def test_positive_limit_still_pauses_after_configured_hops(self):
+        router = Router(["alpha", "beta"], default_mention="none", max_hops=2)
+
+        self.assertEqual(router.get_targets("alpha", "@beta first"), ["beta"])
+        self.assertEqual(router.get_targets("alpha", "@beta second"), ["beta"])
+        self.assertEqual(router.get_targets("alpha", "@beta blocked"), [])
+        self.assertTrue(router.is_paused())
+
+    def test_zero_disables_loop_guard(self):
+        router = Router(["alpha", "beta"], default_mention="none", max_hops=0)
+
+        for index in range(100):
+            self.assertEqual(
+                router.get_targets("alpha", f"@beta hop {index}"),
+                ["beta"],
+            )
+        self.assertFalse(router.is_paused())
+
+    def test_disabling_guard_releases_existing_pause_and_resets_state(self):
+        router = Router(["alpha", "beta"], default_mention="none", max_hops=1)
+        self.assertEqual(router.get_targets("alpha", "@beta allowed"), ["beta"])
+        self.assertEqual(router.get_targets("alpha", "@beta blocked"), [])
+        self.assertTrue(router.is_paused())
+        router.set_guard_emitted()
+
+        router.max_hops = 0
+
+        self.assertFalse(router.is_paused())
+        self.assertFalse(router.is_guard_emitted())
+        self.assertEqual(router.get_targets("alpha", "@beta resumed"), ["beta"])
+
+        # Re-enabling starts from a clean counter rather than the old pause.
+        router.max_hops = 1
+        self.assertEqual(router.get_targets("alpha", "@beta allowed again"), ["beta"])
+        self.assertEqual(router.get_targets("alpha", "@beta blocked again"), [])
+        self.assertTrue(router.is_paused())
+
+
 if __name__ == "__main__":
     unittest.main()

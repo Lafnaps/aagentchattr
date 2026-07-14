@@ -1,7 +1,9 @@
 """agentchattr — FastAPI web UI + agent auto-trigger."""
 
 import asyncio
+import copy
 import json
+import os
 import re as _re
 import sys
 import threading
@@ -14,7 +16,7 @@ from fastapi.requests import Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from store import MessageStore
+from store import MessageStore, _atomic_write_bytes
 from rules import RuleStore
 from summaries import SummaryStore
 from jobs import JobStore
@@ -22,8 +24,18 @@ from schedules import ScheduleStore, parse_schedule_spec
 from router import Router
 from agents import AgentTrigger
 from registry import RuntimeRegistry
+from migration_lease import MigrationLeaseError, MigrationLeaseStore
 from session_store import SessionStore, validate_session_template
 from session_engine import SessionEngine
+from channel_policy import (
+    CHANNEL_CATALOG_LOCK,
+    CHANNEL_NAME_RE,
+    DEFAULT_MAX_CHANNELS,
+    DEFAULT_MAX_DISCOVERED_CHANNELS,
+    HARD_MAX_DISCOVERED_CHANNELS,
+    bounded_discovery_limit,
+    channel_name_error,
+)
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +50,7 @@ schedules: ScheduleStore | None = None
 router: Router | None = None
 agents: AgentTrigger | None = None
 registry: RuntimeRegistry | None = None
+migration_leases: MigrationLeaseStore | None = None
 session_store: SessionStore | None = None
 session_engine: SessionEngine | None = None
 config: dict = {}
@@ -52,17 +65,27 @@ room_settings: dict = {
     "username": "user",
     "font": "sans",
     "channels": ["general"],
+    "max_channels": 64,
+    "max_discovered_channels": DEFAULT_MAX_DISCOVERED_CHANNELS,
+    "catalogue_revision": 0,
     "history_limit": "all",
     "contrast": "normal",
     "custom_roles": [],
 }
 
-# Channel validation
-_CHANNEL_NAME_RE = _re.compile(r'^[a-z0-9][a-z0-9\-]{0,19}$')
-MAX_CHANNELS = 8
+# Channel validation and admission.  Manual creation uses ``max_channels``;
+# authenticated message discovery has a separate, bounded safety ceiling.
+_CHANNEL_NAME_RE = CHANNEL_NAME_RE  # backward-compatible private alias
+_channel_catalog_lock = CHANNEL_CATALOG_LOCK
+_catalogue_broadcast_pending: set[str] = set()
+_channel_outbound_lock = asyncio.Lock()
+_structured_broadcast_suspended = 0
+_transaction_event_local = threading.local()
+_pending_transaction_events: dict[str, list[tuple]] = {}
 
 # Agent hats (persisted to data/hats.json)
 agent_hats: dict[str, str] = {}  # { agent_name: svg_string }
+_hat_lock = threading.RLock()
 
 
 def _hats_path() -> Path:
@@ -75,15 +98,19 @@ def _load_hats():
     p = _hats_path()
     if p.exists():
         try:
-            agent_hats = json.loads(p.read_text("utf-8"))
+            loaded = json.loads(p.read_text("utf-8"))
+            with _hat_lock:
+                agent_hats = loaded if isinstance(loaded, dict) else {}
         except Exception:
-            agent_hats = {}
+            with _hat_lock:
+                agent_hats = {}
 
 
-def _save_hats():
+def _save_hats(hats: dict | None = None):
     p = _hats_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(agent_hats), "utf-8")
+    payload = agent_hats if hats is None else hats
+    _atomic_write_bytes(p, json.dumps(payload).encode("utf-8"))
 
 
 def _sanitize_svg(svg: str) -> str:
@@ -102,8 +129,12 @@ def set_agent_hat(agent: str, svg: str) -> str | None:
     if len(svg) > 5120:
         return "Hat SVG too large (max 5KB)."
     svg = _sanitize_svg(svg)
-    agent_hats[agent.lower()] = svg
-    _save_hats()
+    with _hat_lock:
+        updated = dict(agent_hats)
+        updated[agent.lower()] = svg
+        _save_hats(updated)
+        agent_hats.clear()
+        agent_hats.update(updated)
     if _event_loop:
         asyncio.run_coroutine_threadsafe(broadcast_hats(), _event_loop)
     return None
@@ -112,9 +143,16 @@ def set_agent_hat(agent: str, svg: str) -> str | None:
 def clear_agent_hat(agent: str):
     """Remove an agent's hat."""
     key = agent.lower()
-    if key in agent_hats:
-        del agent_hats[key]
-        _save_hats()
+    changed = False
+    with _hat_lock:
+        if key in agent_hats:
+            updated = dict(agent_hats)
+            del updated[key]
+            _save_hats(updated)
+            agent_hats.clear()
+            agent_hats.update(updated)
+            changed = True
+    if changed:
         if _event_loop:
             asyncio.run_coroutine_threadsafe(broadcast_hats(), _event_loop)
 
@@ -127,23 +165,691 @@ def _settings_path() -> Path:
 def _load_settings():
     global room_settings
     p = _settings_path()
+    saved = {}
     if p.exists():
         try:
             saved = json.loads(p.read_text("utf-8"))
+        except Exception:
+            saved = {}
+
+    with _channel_catalog_lock:
+        if isinstance(saved, dict):
             room_settings.update(saved)
+        try:
+            revision = max(0, int(room_settings.get("catalogue_revision", 0)))
+        except (TypeError, ValueError):
+            revision = 0
+        room_settings["catalogue_revision"] = revision
+
+        # The discovery ceiling is configurable but cannot exceed the compiled
+        # safety bound, even if settings.json is edited by hand.
+        discovery_limit = bounded_discovery_limit(
+            room_settings.get("max_discovered_channels", DEFAULT_MAX_DISCOVERED_CHANNELS)
+        )
+        room_settings["max_discovered_channels"] = discovery_limit
+
+        configured = room_settings.get("channels", [])
+        original_channels = configured if isinstance(configured, list) else []
+        normalized = ["general"]
+        for channel in original_channels:
+            if channel == "general" or channel_name_error(channel):
+                continue
+            if channel in normalized:
+                continue
+            if len(normalized) >= discovery_limit:
+                log.error(
+                    "channel catalogue exceeds bounded discovery ceiling %d; "
+                    "ignoring persisted channel %r",
+                    discovery_limit,
+                    channel,
+                )
+                continue
+            normalized.append(channel)
+        room_settings["channels"] = normalized
+
+        try:
+            requested_manual_limit = int(
+                room_settings.get("max_channels", DEFAULT_MAX_CHANNELS)
+            )
+        except (TypeError, ValueError):
+            requested_manual_limit = DEFAULT_MAX_CHANNELS
+        room_settings["max_channels"] = max(
+            1, min(requested_manual_limit, discovery_limit)
+        )
+
+        catalogue_normalized = original_channels != normalized
+        if catalogue_normalized:
+            _bump_catalogue_revision_locked()
+        normalization_needed = (
+            catalogue_normalized
+            or saved.get("catalogue_revision") != room_settings["catalogue_revision"]
+            or saved.get("max_discovered_channels") != discovery_limit
+            or saved.get("max_channels") != room_settings["max_channels"]
+        )
+        if normalization_needed:
+            _save_settings()
+
+
+def _bump_catalogue_revision_locked() -> int:
+    """Increment the persisted catalogue fence; caller holds the shared RLock."""
+    revision = max(0, int(room_settings.get("catalogue_revision", 0))) + 1
+    room_settings["catalogue_revision"] = revision
+    return revision
+
+
+def _settings_snapshot_locked() -> dict:
+    """Return an isolated settings snapshot; caller holds the shared RLock."""
+    return json.loads(json.dumps(room_settings))
+
+
+def _settings_snapshot() -> dict:
+    with _channel_catalog_lock:
+        return _settings_snapshot_locked()
+
+
+def _catalogue_revision() -> int:
+    with _channel_catalog_lock:
+        return int(room_settings.get("catalogue_revision", 0))
+
+
+def _channel_discovery_limit() -> int:
+    """Return the effective bounded catalogue ceiling."""
+    with _channel_catalog_lock:
+        limit = bounded_discovery_limit(
+            room_settings.get("max_discovered_channels", DEFAULT_MAX_DISCOVERED_CHANNELS)
+        )
+        room_settings["max_discovered_channels"] = limit
+        return limit
+
+
+def _admit_message_channel(
+    channel: object, *, persist: bool = True,
+) -> tuple[bool, str | None]:
+    """Atomically reserve a channel in the web catalogue.
+
+    Returns ``(added, error)``.  A duplicate is successful with ``added=False``;
+    malformed names and a full catalogue fail with an actionable error.
+    """
+    error = channel_name_error(channel)
+    if error:
+        return False, error
+
+    with _channel_catalog_lock:
+        channels = room_settings.setdefault("channels", ["general"])
+        if channel in channels:
+            return False, None
+        limit = _channel_discovery_limit()
+        if len(channels) >= limit:
+            return False, (
+                f"channel catalogue is full ({len(channels)}/{limit}); "
+                "delete an unused channel or raise max_discovered_channels "
+                f"(hard maximum {HARD_MAX_DISCOVERED_CHANNELS})"
+            )
+        channels.append(channel)
+        _bump_catalogue_revision_locked()
+        _catalogue_broadcast_pending.add(channel)
+        if persist:
+            try:
+                _save_settings()
+            except OSError:
+                # The durable message log can restore the catalogue on startup.
+                log.exception("could not persist discovered channel %s", channel)
+        return True, None
+
+
+def _run_channel_state_transaction(
+    channel: object,
+    mutation,
+    *,
+    success=None,
+    compensator=None,
+) -> tuple[object | None, bool, str | None]:
+    """Reserve ``channel`` and run a synchronous structured-state mutation.
+
+    The catalogue lock covers both reservation and mutation, so a concurrent
+    full-catalogue race can never leave a job/rule/summary/session referring to
+    a channel which was not admitted.  A newly-created, still-unpublished
+    reservation is rolled back *including its revision* when the mutation
+    raises or reports failure.
+
+    ``success`` defaults to ``result is not None``. ``compensator(result)`` is
+    required for mutations that persist state: it removes that state durably if
+    the final atomic settings commit fails.  If compensation itself fails, the
+    admitted channel is deliberately retained in memory (fail-closed) so the
+    runtime never hides still-persisted structured state; startup reconciliation
+    repairs its catalogue entry from the durable stores.
+    """
+    if success is None:
+        success = lambda result: result is not None
+
+    def restore_catalogue():
+        room_settings.clear()
+        room_settings.update(settings_before)
+        _catalogue_broadcast_pending.clear()
+        _catalogue_broadcast_pending.update(pending_before)
+
+    def retain_catalogue_fail_closed():
+        try:
+            _save_settings()
+        except Exception:
+            log.exception(
+                "could not persist fail-closed channel reservation %r", channel,
+            )
+
+    def durable_state_exists() -> bool | None:
+        """True/False when inspectable; None means retain admission safely."""
+        try:
+            if store is not None and channel in store.get_channels():
+                return True
+            if jobs is not None and hasattr(jobs, "list_all"):
+                job_items = jobs.list_all(channel=channel)
+                if isinstance(job_items, list) and job_items:
+                    return True
+            if schedules is not None and hasattr(schedules, "list_all"):
+                schedule_items = schedules.list_all()
+                if isinstance(schedule_items, list) and any(
+                    item.get("channel", "general") == channel
+                    for item in schedule_items
+                ):
+                    return True
+            if summaries is not None and summaries.get(channel) is not None:
+                return True
+            if session_store is not None and hasattr(session_store, "list_all"):
+                session_items = session_store.list_all(channel=channel)
+                if isinstance(session_items, list) and session_items:
+                    return True
+            return False
+        except Exception:
+            log.exception(
+                "could not inspect durable state after failed channel mutation %r",
+                channel,
+            )
+            return None
+
+    previous_events = getattr(_transaction_event_local, "events", None)
+    transaction_events: list[tuple] = []
+    _transaction_event_local.events = transaction_events
+    committed = False
+    result = None
+    added = False
+    mutation_succeeded = False
+    outcome = None
+    try:
+        with _channel_catalog_lock:
+            settings_before = _settings_snapshot_locked()
+            pending_before = set(_catalogue_broadcast_pending)
+            added, error = _admit_message_channel(channel, persist=False)
+            if error:
+                outcome = (None, False, error)
+            else:
+                try:
+                    result = mutation()
+                    mutation_succeeded = bool(success(result))
+                except Exception as exc:
+                    if added:
+                        rollback_state = getattr(
+                            exc, "_channel_transaction_state", None,
+                        )
+                        remaining = durable_state_exists()
+                        compensated = False
+                        if compensator is not None and (
+                            rollback_state is not None or remaining is not False
+                        ):
+                            try:
+                                compensator(rollback_state)
+                                compensated = True
+                            except Exception:
+                                log.exception(
+                                    "channel mutation compensation failed for %r; "
+                                    "retaining admitted channel fail-closed",
+                                    channel,
+                                )
+                        if compensated:
+                            remaining = durable_state_exists()
+                        if remaining is False:
+                            restore_catalogue()
+                        else:
+                            retain_catalogue_fail_closed()
+                    raise
+                if added and not mutation_succeeded:
+                    remaining = durable_state_exists()
+                    compensated = False
+                    if compensator is not None and (
+                        result is not None or remaining is not False
+                    ):
+                        try:
+                            compensator(result)
+                            compensated = True
+                        except Exception:
+                            log.exception(
+                                "unsuccessful channel mutation compensation failed for %r",
+                                channel,
+                            )
+                    if compensated:
+                        remaining = durable_state_exists()
+                    if remaining is False:
+                        restore_catalogue()
+                    else:
+                        retain_catalogue_fail_closed()
+                elif added:
+                    try:
+                        _save_settings()
+                    except Exception:
+                        compensated = False
+                        if compensator is not None:
+                            try:
+                                compensator(result)
+                                compensated = True
+                            except Exception:
+                                log.exception(
+                                    "channel transaction compensation failed for %r; "
+                                    "retaining admitted channel fail-closed",
+                                    channel,
+                                )
+                        remaining = durable_state_exists()
+                        if remaining is False:
+                            restore_catalogue()
+                        else:
+                            retain_catalogue_fail_closed()
+                        raise
+                committed = mutation_succeeded
+                outcome = (result, added and mutation_succeeded, None)
+    finally:
+        if previous_events is None:
+            try:
+                del _transaction_event_local.events
+            except AttributeError:
+                pass
+        else:
+            _transaction_event_local.events = previous_events
+
+    if committed and transaction_events:
+        if previous_events is not None:
+            previous_events.extend(transaction_events)
+        elif added:
+            with _channel_catalog_lock:
+                _pending_transaction_events.setdefault(
+                    str(channel), [],
+                ).extend(transaction_events)
+            _schedule_pending_channel_publish(str(channel))
+        else:
+            _dispatch_transaction_events(transaction_events)
+    return outcome
+
+
+def _rollback_mutation_state(state, compensator):
+    """Expose a rollback token when an inner compensation itself fails."""
+    try:
+        compensator(state)
+    except Exception as exc:
+        try:
+            setattr(exc, "_channel_transaction_state", state)
         except Exception:
             pass
-    # Ensure "general" always exists and is first
-    if "channels" not in room_settings or not room_settings["channels"]:
-        room_settings["channels"] = ["general"]
-    elif "general" not in room_settings["channels"]:
-        room_settings["channels"].insert(0, "general")
+        raise
+
+
+def _run_buffered_store_transaction(mutation):
+    """Suppress store callbacks until a multi-store mutation fully commits."""
+    previous_events = getattr(_transaction_event_local, "events", None)
+    events: list[tuple] = []
+    _transaction_event_local.events = events
+    committed = False
+    try:
+        result = mutation()
+        committed = True
+    finally:
+        if previous_events is None:
+            try:
+                del _transaction_event_local.events
+            except AttributeError:
+                pass
+        else:
+            _transaction_event_local.events = previous_events
+    if committed and events:
+        if previous_events is not None:
+            previous_events.extend(events)
+        else:
+            _dispatch_transaction_events(events)
+    return result
+
+
+async def _publish_channel_transaction(channel: str, added: bool):
+    """Publish a successful reservation before related async callbacks run."""
+    if not added:
+        return
+    await _publish_pending_channel_events(channel)
+
+
+def _register_message_channel(channel: str) -> bool:
+    """Add a valid message channel to the persistent web catalogue.
+
+    Messages can enter through WebSocket, REST, MCP, schedules, and background
+    callbacks. Registration is centralized at the store-to-web boundary rather
+    than duplicated in every ingress path. Returns True only on a change.
+    """
+    added, _error = _admit_message_channel(channel)
+    return added
+
+
+def _reconcile_message_channels() -> list[str]:
+    """Restore every durable store's channels with one save/broadcast.
+
+    Structured stores are included so a fail-closed transaction whose final
+    catalogue persistence could not complete is self-healing on restart even
+    when it has no timeline breadcrumb (notably schedules).
+    """
+    added: list[str] = []
+    if not store:
+        return added
+    durable_channels = list(store.get_channels())
+    if jobs is not None:
+        durable_channels.extend(item.get("channel", "general") for item in jobs.list_all())
+    if schedules is not None:
+        durable_channels.extend(item.get("channel", "general") for item in schedules.list_all())
+    if summaries is not None:
+        durable_channels.extend(summaries.get_all().keys())
+    if session_store is not None:
+        durable_channels.extend(item.get("channel", "general") for item in session_store.list_all())
+    with _channel_catalog_lock:
+        channels = room_settings.setdefault("channels", ["general"])
+        limit = _channel_discovery_limit()
+        for channel in durable_channels:
+            if channel_name_error(channel) or channel in channels:
+                continue
+            if len(channels) >= limit:
+                log.error(
+                    "cannot discover historical channel %r: catalogue full (%d/%d)",
+                    channel,
+                    len(channels),
+                    limit,
+                )
+                continue
+            channels.append(channel)
+            added.append(channel)
+        if added:
+            _bump_catalogue_revision_locked()
+            try:
+                _save_settings()
+            except OSError:
+                log.exception("could not persist reconciled channel catalogue")
+    if added:
+        _queue_settings_broadcast()
+    return added
+
+
+def _queue_settings_broadcast():
+    """Schedule exactly one settings broadcast from sync startup/worker code."""
+    if _event_loop is None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        if loop is _event_loop:
+            asyncio.ensure_future(broadcast_settings())
+            return
+    except RuntimeError:
+        pass
+    asyncio.run_coroutine_threadsafe(broadcast_settings(), _event_loop)
+
+
+def store_channel_message(sender: str, text: str, **kwargs) -> tuple[dict | None, str | None]:
+    """Validate/admit a channel and persist its message as one transaction.
+
+    MCP worker threads, REST, and WebSocket ingress all use this function so a
+    delete cannot slip between catalogue reservation and message persistence.
+    """
+    channel = kwargs.get("channel", "general")
+    with _channel_catalog_lock:
+        settings_before = _settings_snapshot_locked()
+        pending_before = set(_catalogue_broadcast_pending)
+        # Do not publish a catalogue entry before its durable message exists.
+        # The message is the recovery source if the final settings commit fails.
+        added, error = _admit_message_channel(channel, persist=False)
+        if error:
+            return None, error
+        try:
+            message = store.add(sender, text, **kwargs)
+        except Exception:
+            if added:
+                room_settings.clear()
+                room_settings.update(settings_before)
+                _catalogue_broadcast_pending.clear()
+                _catalogue_broadcast_pending.update(pending_before)
+            raise
+        if added:
+            try:
+                _save_settings()
+            except Exception:
+                # The record is already durable.  Retain the channel visibly
+                # fail-closed; startup reconciliation can persist it later.
+                log.exception(
+                    "could not persist channel %s after durable message; "
+                    "retaining runtime admission",
+                    channel,
+                )
+        return message, None
+
+
+def _delete_catalogued_channel(name: str) -> tuple[bool, str | None]:
+    """Delete catalogue state and messages without an add/delete race."""
+    global _last_active_channel
+    with _channel_catalog_lock:
+        channels = room_settings.setdefault("channels", ["general"])
+        if name == "general":
+            return False, "the general channel cannot be deleted"
+        if name not in channels:
+            return False, f"channel '{name}' does not exist"
+        dependency_error = _channel_dependency_error_locked(name)
+        if dependency_error:
+            return False, dependency_error
+        settings_before = _settings_snapshot_locked()
+        pending_before = set(_catalogue_broadcast_pending)
+        last_before = _last_active_channel
+        agent_last_before = dict(_agent_last_channel)
+        message_state_before = store.snapshot_state()
+        try:
+            # Delete messages first. If persistence fails, retaining an empty
+            # catalogue entry is safer than hiding messages that may remain.
+            store.delete_channel(name)
+            channels.remove(name)
+            _bump_catalogue_revision_locked()
+            _catalogue_broadcast_pending.discard(name)
+            _migrate_channel_activity_locked(name, "general")
+            _save_settings()
+        except Exception:
+            room_settings.clear()
+            room_settings.update(settings_before)
+            _catalogue_broadcast_pending.clear()
+            _catalogue_broadcast_pending.update(pending_before)
+            _last_active_channel = last_before
+            _agent_last_channel.clear()
+            _agent_last_channel.update(agent_last_before)
+            try:
+                store.restore_state(message_state_before)
+            except Exception:
+                # The old channel remains visible.  This is fail-closed even
+                # if message restoration itself cannot be completed.
+                log.exception("failed to restore messages after channel delete failure")
+            raise
+        return True, None
+
+
+def _rename_catalogued_channel(
+    old_name: str, new_name: str,
+) -> tuple[dict | None, str | None]:
+    """Rename one channel and return the authoritative settings snapshot."""
+    global _last_active_channel
+    with _channel_catalog_lock:
+        channels = room_settings.setdefault("channels", ["general"])
+        if old_name == "general":
+            return None, "the general channel cannot be renamed"
+        if old_name not in channels:
+            return None, f"channel '{old_name}' does not exist"
+        if new_name in channels:
+            return None, f"channel '{new_name}' already exists"
+        dependency_error = _channel_dependency_error_locked(old_name)
+        if dependency_error:
+            return None, dependency_error
+
+        settings_before = _settings_snapshot_locked()
+        pending_before = set(_catalogue_broadcast_pending)
+        last_before = _last_active_channel
+        agent_last_before = dict(_agent_last_channel)
+        message_state_before = store.snapshot_state()
+        idx = channels.index(old_name)
+        channels[idx] = new_name
+        try:
+            store.rename_channel(old_name, new_name)
+            _bump_catalogue_revision_locked()
+            _catalogue_broadcast_pending.discard(old_name)
+            _catalogue_broadcast_pending.discard(new_name)
+            _migrate_channel_activity_locked(old_name, new_name)
+            _save_settings()
+        except Exception:
+            room_settings.clear()
+            room_settings.update(settings_before)
+            _catalogue_broadcast_pending.clear()
+            _catalogue_broadcast_pending.update(pending_before)
+            _last_active_channel = last_before
+            _agent_last_channel.clear()
+            _agent_last_channel.update(agent_last_before)
+            try:
+                store.restore_state(message_state_before)
+            except Exception:
+                log.exception(
+                    "failed to restore message channel rename %s -> %s; "
+                    "exposing every observed message channel fail-closed",
+                    old_name,
+                    new_name,
+                )
+                observed = store.get_channels()
+                channels = room_settings.setdefault("channels", ["general"])
+                for observed_channel in observed:
+                    if not channel_name_error(observed_channel) and observed_channel not in channels:
+                        channels.append(observed_channel)
+                _bump_catalogue_revision_locked()
+                try:
+                    _save_settings()
+                except Exception:
+                    log.exception("could not persist fail-closed rename catalogue")
+            raise
+        return _settings_snapshot_locked(), None
+
+
+async def _rename_channel_and_broadcast(
+    old_name: str, new_name: str,
+) -> tuple[bool, str | None]:
+    """Commit rename and its two UI frames in one outbound critical section."""
+    async with _channel_outbound_lock:
+        snapshot, error = _rename_catalogued_channel(old_name, new_name)
+        if error:
+            return False, error
+        import mcp_bridge
+        try:
+            mcp_bridge.migrate_cursors_rename(old_name, new_name)
+        except Exception:
+            log.exception("could not migrate MCP cursors for channel rename %s -> %s", old_name, new_name)
+        revision = snapshot["catalogue_revision"]
+
+        # Rename first: clients which were actively viewing the old channel
+        # migrate their DOM and active pointer before settings removes old_name.
+        await _broadcast_channel_payload_locked({
+            "type": "channel_renamed",
+            "old_name": old_name,
+            "new_name": new_name,
+            "catalogue_revision": revision,
+        })
+        await _broadcast_channel_payload_locked({
+            "type": "settings",
+            "data": snapshot,
+            "catalogue_revision": revision,
+        })
+        return True, None
 
 
 def _save_settings():
-    p = _settings_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(room_settings, indent=2), "utf-8")
+    """Atomically persist a locked settings snapshot with best-effort dir sync."""
+    with _channel_catalog_lock:
+        p = _settings_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(f".{p.name}.{uuid.uuid4().hex}.tmp")
+        payload = json.dumps(_settings_snapshot_locked(), indent=2)
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, p)
+            try:
+                dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                dir_fd = os.open(str(p.parent), dir_flags)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                # Directory fsync is unsupported on some Windows filesystems.
+                pass
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+
+
+def _apply_room_settings_update(new: dict):
+    """Persist a settings update before applying router side effects."""
+    with _channel_catalog_lock:
+        settings_before = copy.deepcopy(room_settings)
+        router_hops_to_apply = None
+        try:
+            if "title" in new and isinstance(new["title"], str):
+                room_settings["title"] = new["title"].strip() or "agentchattr"
+            if "username" in new and isinstance(new["username"], str):
+                room_settings["username"] = new["username"].strip() or "user"
+            if "font" in new and new["font"] in ("mono", "serif", "sans"):
+                room_settings["font"] = new["font"]
+            if "max_agent_hops" in new:
+                try:
+                    hops = max(0, min(int(new["max_agent_hops"]), 50))
+                    room_settings["max_agent_hops"] = hops
+                    router_hops_to_apply = hops
+                except (ValueError, TypeError):
+                    pass
+            if "contrast" in new and new["contrast"] in ("normal", "high"):
+                room_settings["contrast"] = new["contrast"]
+            if "rules_refresh_interval" in new:
+                try:
+                    interval = int(new["rules_refresh_interval"])
+                    room_settings["rules_refresh_interval"] = max(0, min(interval, 100))
+                except (ValueError, TypeError):
+                    pass
+            if "history_limit" in new:
+                value = str(new["history_limit"]).strip().lower()
+                if value == "all":
+                    room_settings["history_limit"] = "all"
+                else:
+                    try:
+                        value_int = int(value)
+                        room_settings["history_limit"] = max(1, min(value_int, 10000))
+                    except (ValueError, TypeError):
+                        pass
+            if "custom_roles" in new and isinstance(new["custom_roles"], list):
+                room_settings["custom_roles"] = [
+                    str(role).strip()[:20] for role in new["custom_roles"]
+                    if isinstance(role, str) and role.strip()
+                ][:20]
+            _save_settings()
+        except Exception:
+            room_settings.clear()
+            room_settings.update(settings_before)
+            raise
+        # Setting zero resets every channel's loop-guard state.  Do it only
+        # after the corresponding settings bytes are durable, so a failed save
+        # cannot silently release paused channels or erase their hop counters.
+        if router_hops_to_apply is not None and router is not None:
+            router.max_hops = router_hops_to_apply
 
 
 def _extract_agent_token(request: Request) -> str:
@@ -209,6 +915,17 @@ def _install_security_middleware(token: str, cfg: dict):
             # Allow registered agents to authenticate via Bearer token
             # for /api/messages and /api/send (no browser session needed).
             auth_header = request.headers.get("authorization", "")
+            # /api/rotate-token authenticates by possession INSIDE the endpoint
+            # (live instances only). It must not go through resolve_token here:
+            # that call transparently reactivates reclaimable identities, and a
+            # dormant token must never mint a fresh credential via rotation.
+            if auth_header.lower().startswith("bearer ") and path.startswith("/api/rotate-token/"):
+                return await call_next(request)
+            # Migration-lease endpoints validate the current bearer and exact
+            # identity atomically with the lease/registry lock.  Pre-resolving
+            # here would reintroduce a timeout/deregister race.
+            if auth_header.lower().startswith("bearer ") and path.startswith("/api/migration-lease/"):
+                return await call_next(request)
             if auth_header.lower().startswith("bearer ") and (path in ("/api/messages", "/api/send") or path.startswith("/api/rules/")):
                 bearer = auth_header[7:].strip()
                 if _self.registry and _self.registry.resolve_token(bearer):
@@ -230,13 +947,17 @@ def _install_security_middleware(token: str, cfg: dict):
 
 
 def configure(cfg: dict, session_token: str = ""):
-    global store, rules, summaries, jobs, schedules, router, agents, registry, session_store, session_engine, config
+    global store, rules, summaries, jobs, schedules, router, agents, registry, migration_leases, session_store, session_engine, config
     config = cfg
     # --- Security: store the session token and install middleware ---
     _install_security_middleware(session_token, cfg)
 
     data_dir = cfg.get("server", {}).get("data_dir", "./data")
     Path(data_dir).mkdir(parents=True, exist_ok=True)
+    # Load the strict lease store before any registry/background cleanup.  A
+    # corrupt or torn store remains attached in an unhealthy fail-closed state,
+    # freezing topology until an operator repairs it.
+    migration_leases = MigrationLeaseStore(data_dir)
 
     log_path = Path(data_dir) / "agentchattr_log.jsonl"
     legacy_log_path = Path(data_dir) / "room_log.jsonl"
@@ -276,11 +997,26 @@ def configure(cfg: dict, session_token: str = ""):
     # Registry: single source of truth for all live agent state
     registry = RuntimeRegistry(data_dir=data_dir)
     registry.seed(cfg.get("agents", {}))
+    registry.attach_migration_leases(migration_leases)
+    restored_leases = migration_leases.reconcile_registry(registry)
+    if not migration_leases.healthy:
+        log.error("Migration lease protection is fail-closed: %s", migration_leases.health_error)
+    elif restored_leases:
+        # Arm the ordinary crash timeout. While held, atomic deregistration is
+        # rejected through the fixed recovery-protection horizon (or a later
+        # active expiry); only then can the stale timestamp resume cleanup.
+        import time as _lease_time
+        import mcp_bridge as _lease_mcp
+        with _lease_mcp._presence_lock:
+            for restored_name in restored_leases:
+                _lease_mcp._presence[restored_name] = _lease_time.time()
     registry.on_change(_on_registry_change)
 
     # Router starts with base agent names (backward compat for direct MCP users),
     # registry.on_change updates it dynamically when instances register/deregister
-    agent_names = list(cfg.get("agents", {}).keys())
+    agent_names = list(set(
+        list(cfg.get("agents", {}).keys()) + registry.get_active_names()
+    ))
     router = Router(
         agent_names=agent_names,
         default_mention=cfg.get("routing", {}).get("default", "none"),
@@ -303,6 +1039,10 @@ def configure(cfg: dict, session_token: str = ""):
     store.on_message(_on_store_message)
 
     _load_settings()
+    # The message log is durable while settings may lag (for example, an
+    # MCP-created channel from an older server). Reconcile before the first
+    # browser connects so channel tabs and per-channel history are complete.
+    _reconcile_message_channels()
     _load_hats()
 
     # Apply saved loop guard setting
@@ -366,9 +1106,9 @@ def configure(cfg: dict, session_token: str = ""):
                     with mcp_bridge._presence_lock:
                         last_seen = mcp_bridge._presence.get(name, 0)
                     if last_seen > 0 and now - last_seen > _CRASH_TIMEOUT:
-                        log.info(f"Crash timeout: deregistering {name} (no heartbeat for {_CRASH_TIMEOUT}s)")
                         result = registry.deregister(name)
-                        if result:
+                        if result and result.get("ok"):
+                            log.info(f"Crash timeout: deregistering {name} (no heartbeat for {_CRASH_TIMEOUT}s)")
                             mcp_bridge.purge_identity(name)
                             registry.clean_renames_for(name)
                             renamed = result.get("_renamed_back")
@@ -470,11 +1210,14 @@ def configure(cfg: dict, session_token: str = ""):
                     full_text = f"{mention_str} {prompt}" if mention_str else prompt
                     # store.add triggers _handle_new_message via callback,
                     # which routes @mentions to agents — no manual trigger needed.
-                    store.add(
+                    _msg, channel_error = store_channel_message(
                         sender,
                         full_text,
                         channel=channel,
                     )
+                    if channel_error:
+                        log.error("scheduled message rejected for channel %r: %s", channel, channel_error)
+                        continue
                     if s.get("one_shot"):
                         schedules.delete(s["id"])
                     else:
@@ -494,6 +1237,52 @@ _last_active_channel: str = "general"  # last channel any message was sent in
 # instead of the global last-active channel (which is usually #general and made
 # leave spam land in the wrong place).
 _agent_last_channel: dict[str, str] = {}
+
+
+def _migrate_channel_activity_locked(old_channel: str, new_channel: str):
+    """Migrate all in-memory channel pointers; caller holds catalogue lock."""
+    global _last_active_channel
+    if _last_active_channel == old_channel:
+        _last_active_channel = new_channel
+    for agent_name, channel in list(_agent_last_channel.items()):
+        if channel == old_channel:
+            _agent_last_channel[agent_name] = new_channel
+
+
+def _channel_dependency_error_locked(channel: str) -> str | None:
+    """Reject destructive catalogue changes while structured state refers to it.
+
+    Historical sessions count as dependencies too: their persisted transcript
+    and output references must not silently change meaning after a channel
+    rename/delete.
+    """
+    dependencies: list[str] = []
+    try:
+        if jobs is not None:
+            count = len(jobs.list_all(channel=channel))
+            if count:
+                dependencies.append(f"jobs ({count})")
+        if schedules is not None:
+            count = sum(1 for item in schedules.list_all() if item.get("channel", "general") == channel)
+            if count:
+                dependencies.append(f"schedules ({count})")
+        if summaries is not None and summaries.get(channel) is not None:
+            dependencies.append("summary")
+        if session_store is not None:
+            count = len(session_store.list_all(channel=channel))
+            if count:
+                dependencies.append(f"sessions ({count})")
+    except Exception:
+        log.exception("could not verify dependencies for channel %s", channel)
+        return (
+            f"channel '{channel}' dependency check failed; destructive change rejected"
+        )
+    if not dependencies:
+        return None
+    return (
+        f"channel '{channel}' is in use by {', '.join(dependencies)}; "
+        "remove or migrate those dependencies first"
+    )
 
 
 def _migrate_agent_last_channel(old_name: str, new_name: str):
@@ -516,62 +1305,99 @@ def set_event_loop(loop):
     _event_loop = loop
 
 
-def _on_store_message(msg: dict):
-    """Called from any thread when a message is added to the store."""
+async def _deliver_transaction_event(event: tuple):
+    kind, action, payload = event
+    if kind == "message":
+        await _handle_new_message(payload)
+    elif kind == "rule":
+        await broadcast_rule(action, payload)
+    elif kind == "job":
+        await broadcast_job(action, payload)
+    elif kind == "schedule":
+        await broadcast_schedule(action, payload)
+    elif kind == "session":
+        await broadcast_session(action, payload)
+
+
+async def _deliver_transaction_events(events: list[tuple]):
+    for event in events:
+        await _deliver_transaction_event(event)
+
+
+def _schedule_coroutine(coro):
     if _event_loop is None:
         return
     try:
-        # If called from the event loop thread (e.g. WebSocket handler),
-        # schedule directly as a task
         loop = asyncio.get_running_loop()
         if loop is _event_loop:
-            asyncio.ensure_future(_handle_new_message(msg))
+            asyncio.ensure_future(coro)
             return
     except RuntimeError:
-        pass  # No running loop — we're in a different thread (MCP)
-    asyncio.run_coroutine_threadsafe(_handle_new_message(msg), _event_loop)
+        pass
+    asyncio.run_coroutine_threadsafe(coro, _event_loop)
+
+
+def _dispatch_transaction_events(events: list[tuple]):
+    if events:
+        _schedule_coroutine(_deliver_transaction_events(events))
+
+
+def _buffer_or_dispatch_event(kind: str, action, payload: dict):
+    if _event_loop is None or _structured_broadcast_suspended:
+        return
+    event = (kind, action, copy.deepcopy(payload))
+    buffer = getattr(_transaction_event_local, "events", None)
+    if buffer is not None:
+        buffer.append(event)
+    else:
+        _dispatch_transaction_events([event])
+
+
+def _schedule_pending_channel_publish(channel: str):
+    if _event_loop is not None:
+        _schedule_coroutine(_publish_pending_channel_events(channel))
+
+
+async def _publish_pending_channel_events(channel: str):
+    """Publish one admitted tab, then release its committed runtime events."""
+    events: list[tuple] = []
+    async with _channel_outbound_lock:
+        with _channel_catalog_lock:
+            needs_settings = channel in _catalogue_broadcast_pending
+            has_events = bool(_pending_transaction_events.get(channel))
+            if not needs_settings and not has_events:
+                return
+            snapshot = _settings_snapshot_locked()
+        if needs_settings:
+            await _broadcast_channel_payload_locked({
+                "type": "settings",
+                "data": snapshot,
+                "catalogue_revision": snapshot["catalogue_revision"],
+            })
+        with _channel_catalog_lock:
+            _catalogue_broadcast_pending.discard(channel)
+            events = _pending_transaction_events.pop(channel, [])
+    await _deliver_transaction_events(events)
+
+
+def _on_store_message(msg: dict):
+    """Called from any thread when a message is added to the store."""
+    _buffer_or_dispatch_event("message", None, msg)
 
 
 def _on_rule_change(action: str, rule: dict):
     """Called from any thread when a rule changes."""
-    if _event_loop is None:
-        return
-    try:
-        loop = asyncio.get_running_loop()
-        if loop is _event_loop:
-            asyncio.ensure_future(broadcast_rule(action, rule))
-            return
-    except RuntimeError:
-        pass
-    asyncio.run_coroutine_threadsafe(broadcast_rule(action, rule), _event_loop)
+    _buffer_or_dispatch_event("rule", action, rule)
 
 
 def _on_job_change(action: str, data: dict):
     """Called from any thread when a job changes."""
-    if _event_loop is None:
-        return
-    try:
-        loop = asyncio.get_running_loop()
-        if loop is _event_loop:
-            asyncio.ensure_future(broadcast_job(action, data))
-            return
-    except RuntimeError:
-        pass
-    asyncio.run_coroutine_threadsafe(broadcast_job(action, data), _event_loop)
+    _buffer_or_dispatch_event("job", action, data)
 
 
 def _on_schedule_change(action: str, schedule: dict):
     """Called from any thread when a schedule changes."""
-    if _event_loop is None:
-        return
-    try:
-        loop = asyncio.get_running_loop()
-        if loop is _event_loop:
-            asyncio.ensure_future(broadcast_schedule(action, schedule))
-            return
-    except RuntimeError:
-        pass
-    asyncio.run_coroutine_threadsafe(broadcast_schedule(action, schedule), _event_loop)
+    _buffer_or_dispatch_event("schedule", action, schedule)
 
 
 def _on_session_change(action: str, session: dict):
@@ -592,7 +1418,7 @@ def _on_session_change(action: str, session: dict):
                 meta = msg.get("metadata") or {}
                 meta["session_output"] = True
                 store.update_message(output_id, {"metadata": meta})
-        store.add(
+        store_channel_message(
             sender="system",
             text=f"Session complete: {session.get('template_name', '?')}",
             msg_type="session_end",
@@ -601,7 +1427,7 @@ def _on_session_change(action: str, session: dict):
         )
     elif action == "interrupt" and store:
         reason = session.get("interrupt_reason", "interrupted")
-        store.add(
+        store_channel_message(
             sender="system",
             text=f"Session ended: {session.get('template_name', '?')} ({reason})",
             msg_type="session_end",
@@ -609,14 +1435,7 @@ def _on_session_change(action: str, session: dict):
             metadata={"session_id": session.get("id"), "reason": reason},
         )
 
-    try:
-        loop = asyncio.get_running_loop()
-        if loop is _event_loop:
-            asyncio.ensure_future(broadcast_session(action, session))
-            return
-    except RuntimeError:
-        pass
-    asyncio.run_coroutine_threadsafe(broadcast_session(action, session), _event_loop)
+    _buffer_or_dispatch_event("session", action, session)
 
 
 _draft_ref_re = _re.compile(r'\[([a-f0-9]{8})\]')
@@ -658,7 +1477,15 @@ def _resolve_draft_lineage(text: str, channel: str) -> tuple[str, int]:
 
 
 async def _handle_new_message(msg: dict):
-    """Broadcast message to web clients + check for @mention triggers."""
+    """Broadcast one live message and route its mentions.
+
+    Race contract: deletion may overtake this callback only after a settings
+    frame admitting the channel has already been sent.  That authoritative
+    frame is allowed to be observed (the deletion's later settings frame
+    converges the UI), but a stale/deleted message must never produce a
+    ``message`` frame, mention trigger, notification, or activity-pointer
+    update.  The repeated durable-id/channel fences below enforce that split.
+    """
     # For broadcast slash commands, suppress the raw message — only the expanded
     # version should appear. Delete from store if it was persisted (MCP path),
     # and skip broadcasting the raw text.
@@ -667,14 +1494,41 @@ async def _handle_new_message(msg: dict):
     sender = msg.get("sender", "")
     channel = msg.get("channel", "general")
 
-    # Track last active channel for leave/join messages (skip system messages)
-    global _last_active_channel
-    if msg_type not in ("system", "leave", "join"):
-        _last_active_channel = channel
-        # Remember where this specific sender was last active so their
-        # disconnect message follows them to the right channel.
-        if sender and sender != "system":
-            _agent_last_channel[sender] = channel
+    # A store callback can be queued and then overtaken by channel/message
+    # deletion.  Never let that stale callback resurrect the channel or emit a
+    # deleted message.  Messages without an id are the intentional WebSocket
+    # slash-command expansion path and are handled below.
+    if "id" in msg and not _persisted_message_matches(msg):
+        return
+
+    # Publish the catalogue before its first message.  Checked ingress reserves
+    # the channel before persisting; legacy/internal writers are admitted here.
+    with _channel_catalog_lock:
+        # Repeat the existence check while holding the same lock used by
+        # channel deletion.  Without this, deletion between the optimistic
+        # check above and catalogue admission could still resurrect the tab.
+        if "id" in msg and not _persisted_message_matches(msg):
+            return
+        added, admission_error = _admit_message_channel(channel)
+        if admission_error:
+            if "id" in msg and _persisted_message_matches(msg):
+                store.delete([msg["id"]])
+            log.error("dropping undiscoverable message channel %r: %s", channel, admission_error)
+            return
+        catalogue_changed = added or channel in _catalogue_broadcast_pending
+    if catalogue_changed:
+        await broadcast_settings()
+
+        with _channel_catalog_lock:
+            _catalogue_broadcast_pending.discard(channel)
+
+        # Deletion can run while a slow WebSocket settings send yields.  Recheck
+        # before the message broadcast so a late callback cannot leak stale UI.
+        if "id" in msg and not _persisted_message_matches(msg):
+            return
+        if channel not in _settings_snapshot().get("channels", ["general"]):
+            return
+
     # Strip @mentions to find the slash command (e.g. "@claude @codex /hatmaking")
     stripped = _re.sub(r"@[\w-]+\s*", "", text).strip().lower()
     _broadcast_cmds = ("/hatmaking", "/artchallenge", "/roastreview", "/poetry")
@@ -696,7 +1550,18 @@ async def _handle_new_message(msg: dict):
     )
 
     if not suppress_broadcast:
-        await broadcast(msg)
+        if await broadcast(msg) is False:
+            return
+
+    # Only a message which survived the outbound catalogue fence may update
+    # routing/presence hints.  Synthetic suppressed commands intentionally
+    # continue through this path.
+    global _last_active_channel
+    if msg_type not in ("system", "leave", "join"):
+        with _channel_catalog_lock:
+            _last_active_channel = channel
+            if sender and sender != "system":
+                _agent_last_channel[sender] = channel
 
     # If the raw slash command was persisted (MCP path), silently remove it.
     # It was never broadcast to WebSocket clients, so no delete event needed.
@@ -863,7 +1728,12 @@ async def _handle_new_message(msg: dict):
         if not mcp_bridge.is_online(target):
             store.add("system", f"{target} appears offline — message queued.", msg_type="system", channel=channel)
         if agents.is_available(target):
-            await agents.trigger(target, message=chat_msg, channel=channel, prompt=custom_prompt)
+            source_ref = f"{msg.get('id')}:{msg.get('uid', '')}"
+            await agents.trigger(
+                target, message=chat_msg, channel=channel,
+                prompt=custom_prompt,
+                action_id=agents.action_id_for("message", source_ref, target),
+            )
 
 
 # --- broadcasting ---
@@ -879,20 +1749,67 @@ async def _broadcast(raw_json: str):
     ws_clients.difference_update(dead)
 
 
-async def broadcast(msg: dict):
-    data = json.dumps({"type": "message", "data": msg})
+def _persisted_message_matches(message: dict) -> bool:
+    """Return whether id, uid and channel still identify this exact record."""
+    if store is None or "id" not in message:
+        return False
+    persisted = store.get_by_id(message["id"])
+    if persisted is None:
+        return False
+    if persisted.get("uid") != message.get("uid"):
+        return False
+    return persisted.get("channel", "general") == message.get("channel", "general")
+
+
+def _message_frame_is_current_locked(payload: dict) -> bool:
+    """Validate a persisted message and its channel at the serialization fence."""
+    if payload.get("type") != "message":
+        return True
+    message = payload.get("data") or {}
+    if "id" not in message:
+        return True
+    if not _persisted_message_matches(message):
+        return False
+    expected_channel = message.get("channel", "general")
+    return expected_channel in room_settings.get("channels", ["general"])
+
+
+async def _broadcast_channel_payload_locked(payload: dict) -> bool:
+    """Send a channel frame while the caller holds the outbound lock."""
     dead = set()
+    with _channel_catalog_lock:
+        # This is deliberately the last check before synchronous JSON
+        # serialization.  A queued callback overtaken by delete/rename must not
+        # notify clients or resurrect an obsolete channel.
+        if not _message_frame_is_current_locked(payload):
+            return False
+        if "catalogue_revision" not in payload:
+            payload = dict(payload)
+            payload["catalogue_revision"] = _catalogue_revision()
+        data = json.dumps(payload)
     for client in list(ws_clients):
         try:
             await client.send_text(data)
         except Exception:
             dead.add(client)
     ws_clients.difference_update(dead)
+    return True
+
+
+async def _broadcast_channel_payload(payload: dict) -> bool:
+    """Serialize catalogue-sensitive frames and attach their revision fence."""
+    async with _channel_outbound_lock:
+        return await _broadcast_channel_payload_locked(payload)
+
+
+async def broadcast(msg: dict):
+    return await _broadcast_channel_payload({"type": "message", "data": msg})
 
 
 async def broadcast_status():
     status = agents.get_status()
-    status["paused"] = any(router.is_paused(ch) for ch in room_settings.get("channels", ["general"]))
+    channels = _settings_snapshot().get("channels", ["general"])
+    status["paused"] = any(router.is_paused(ch) for ch in channels)
     data = json.dumps({"type": "status", "data": status})
     dead = set()
     for client in list(ws_clients):
@@ -940,62 +1857,85 @@ async def broadcast_todo_update(msg_id: int, status: str | None):
 
 
 async def broadcast_settings():
-    data = json.dumps({"type": "settings", "data": room_settings})
-    dead = set()
-    for client in list(ws_clients):
-        try:
-            await client.send_text(data)
-        except Exception:
-            dead.add(client)
-    ws_clients.difference_update(dead)
+    snapshot = _settings_snapshot()
+    await _broadcast_channel_payload({
+        "type": "settings",
+        "data": snapshot,
+        "catalogue_revision": snapshot["catalogue_revision"],
+    })
+
+
+async def _send_ws_channel_error(
+    websocket: WebSocket,
+    operation: str,
+    error: str,
+    *,
+    restore_channel: str | None = None,
+):
+    """Return an authoritative catalogue snapshot for optimistic UI rollback."""
+    snapshot = _settings_snapshot()
+    payload = {
+        "type": "error",
+        "code": "channel_rejected",
+        "operation": operation,
+        "error": error,
+        "settings": snapshot,
+        "catalogue_revision": snapshot["catalogue_revision"],
+    }
+    if restore_channel:
+        payload["restore_channel"] = restore_channel
+    async with _channel_outbound_lock:
+        await websocket.send_text(json.dumps(payload))
+
+
+async def _admit_channel_ingress(channel: object) -> tuple[bool, str | None]:
+    """Admit a channel before non-message state mutation and publish it once."""
+    with _channel_catalog_lock:
+        settings_before = _settings_snapshot_locked()
+        pending_before = set(_catalogue_broadcast_pending)
+        added, error = _admit_message_channel(channel, persist=False)
+        if added:
+            try:
+                _save_settings()
+            except Exception:
+                room_settings.clear()
+                room_settings.update(settings_before)
+                _catalogue_broadcast_pending.clear()
+                _catalogue_broadcast_pending.update(pending_before)
+                return False, "could not persist channel catalogue"
+    if added:
+        await _publish_pending_channel_events(str(channel))
+    return added, error
 
 
 async def broadcast_rule(action: str, rule: dict):
-    data = json.dumps({"type": "rule", "action": action, "data": rule})
-    dead = set()
-    for client in list(ws_clients):
-        try:
-            await client.send_text(data)
-        except Exception:
-            dead.add(client)
-    ws_clients.difference_update(dead)
+    await _broadcast_channel_payload({
+        "type": "rule", "action": action, "data": rule,
+    })
 
 
 async def broadcast_job(action: str, data: dict):
-    payload = json.dumps({"type": "job", "action": action, "data": data})
-    dead = set()
-    for client in list(ws_clients):
-        try:
-            await client.send_text(payload)
-        except Exception:
-            dead.add(client)
-    ws_clients.difference_update(dead)
+    await _broadcast_channel_payload({
+        "type": "job", "action": action, "data": data,
+    })
 
 
 async def broadcast_schedule(action: str, schedule: dict):
-    payload = json.dumps({"type": "schedule", "action": action, "data": schedule})
-    dead = set()
-    for client in list(ws_clients):
-        try:
-            await client.send_text(payload)
-        except Exception:
-            dead.add(client)
-    ws_clients.difference_update(dead)
+    await _broadcast_channel_payload({
+        "type": "schedule", "action": action, "data": schedule,
+    })
 
 
 async def broadcast_session(action: str, session: dict):
-    payload = json.dumps({"type": "session", "action": action, "data": session})
-    dead = set()
-    for client in list(ws_clients):
-        try:
-            await client.send_text(payload)
-        except Exception:
-            dead.add(client)
-    ws_clients.difference_update(dead)
+    await _broadcast_channel_payload({
+        "type": "session", "action": action, "data": session,
+    })
 
 
 async def broadcast_hats():
-    data = json.dumps({"type": "hats", "data": agent_hats})
+    with _hat_lock:
+        hats = copy.deepcopy(agent_hats)
+    data = json.dumps({"type": "hats", "data": hats})
     dead = set()
     for client in list(ws_clients):
         try:
@@ -1035,6 +1975,52 @@ def _on_registry_change():
 
 # --- WebSocket ---
 
+def _rollback_rule_proposal_state(state):
+    """Remove every durable artifact created for one rule proposal."""
+    if not state:
+        return
+    proposal_message = state.get("message")
+    if proposal_message is not None:
+        store.delete([proposal_message["id"]])
+    proposal = state.get("rule")
+    if proposal is not None:
+        rules.delete(proposal["id"])
+
+
+def _create_rule_proposal_state(
+    text: str, author: str, reason: str, channel: str, *, is_human: bool,
+):
+    """Create a rule proposal and its optional timeline card as one state bundle."""
+    state = {"rule": None, "message": None}
+    try:
+        rule = rules.propose(text, author, reason)
+        state["rule"] = rule
+        if rule is None:
+            return None
+        if is_human:
+            if rules.make_draft(rule["id"]) is None:
+                raise RuntimeError("could not move rule proposal to draft")
+        else:
+            message, write_error = store_channel_message(
+                author,
+                f"Rule proposal: {text}",
+                msg_type="rule_proposal",
+                channel=channel,
+                metadata={
+                    "rule_id": rule["id"],
+                    "text": text,
+                    "status": "pending",
+                },
+            )
+            if write_error:
+                raise RuntimeError(write_error)
+            state["message"] = message
+        return state
+    except Exception:
+        _rollback_mutation_state(state, _rollback_rule_proposal_state)
+        raise
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     # --- Security: validate session token on WebSocket connect ---
@@ -1047,61 +2033,53 @@ async def websocket_endpoint(websocket: WebSocket):
         return
 
     await websocket.accept()
-    ws_clients.add(websocket)
 
-    # Send settings
-    await websocket.send_text(json.dumps({"type": "settings", "data": room_settings}))
-
-    # Send registered instances (used for pills/mentions)
-    agent_cfg = registry.get_agent_config() if registry else {}
-    await websocket.send_text(json.dumps({"type": "agents", "data": agent_cfg}))
-
-    # Send base agent colors (used for message coloring, no pills)
-    base_colors = {}
-    for name, cfg in config.get("agents", {}).items():
-        base_colors[name] = {"color": cfg.get("color", "#888"), "label": cfg.get("label", name)}
-    await websocket.send_text(json.dumps({"type": "base_colors", "data": base_colors}))
-
-    # Send todos {msg_id: status}
-    await websocket.send_text(json.dumps({"type": "todos", "data": store.get_todos()}))
-
-    # Send rules
-    await websocket.send_text(json.dumps({"type": "rules", "data": rules.list_all()}))
-
-    # Send hats
-    await websocket.send_text(json.dumps({"type": "hats", "data": agent_hats}))
-
-    # Send jobs
-    await websocket.send_text(json.dumps({"type": "jobs", "data": jobs.list_all()}))
-
-    # Send schedules
-    await websocket.send_text(json.dumps({"type": "schedules", "data": schedules.list_all()}))
-
-    # Send pending instances (so late-connecting browsers still see the naming lightbox)
-    if registry:
-        for inst in registry.get_all().values():
-            if inst.get("state") == "pending":
-                await websocket.send_text(json.dumps({
-                    "type": "pending_instance",
-                    "name": inst["name"],
-                    "base": inst.get("base", ""),
-                    "label": inst.get("label", inst["name"]),
-                    "color": inst.get("color", "#888"),
-                }))
-
-    # Send history (per channel based on history_limit)
-    limit_val = room_settings.get("history_limit", "all")
-    count = 10000 if limit_val == "all" else int(limit_val)
-    
-    history = []
-    for ch in room_settings["channels"]:
-        history.extend(store.get_recent(count, channel=ch))
-    
-    # Sort history by timestamp to interleave messages from different channels correctly
-    history.sort(key=lambda m: m.get("timestamp", 0))
-    
-    for msg in history:
-        await websocket.send_text(json.dumps({"type": "message", "data": msg}))
+    # Snapshot catalogue + history under the shared lock, then serialize the
+    # whole initial stream against live settings/message broadcasts.
+    async with _channel_outbound_lock:
+        ws_clients.add(websocket)
+        with _channel_catalog_lock:
+            settings_snapshot = _settings_snapshot_locked()
+            revision = settings_snapshot["catalogue_revision"]
+            limit_val = settings_snapshot.get("history_limit", "all")
+            count = 10000 if limit_val == "all" else int(limit_val)
+            history = []
+            for ch in settings_snapshot["channels"]:
+                history.extend(store.get_recent(count, channel=ch))
+        history.sort(key=lambda m: m.get("timestamp", 0))
+        await websocket.send_text(json.dumps({
+            "type": "settings", "data": settings_snapshot,
+            "catalogue_revision": revision,
+        }))
+        agent_cfg = registry.get_agent_config() if registry else {}
+        await websocket.send_text(json.dumps({"type": "agents", "data": agent_cfg}))
+        base_colors = {
+            name: {"color": cfg.get("color", "#888"), "label": cfg.get("label", name)}
+            for name, cfg in config.get("agents", {}).items()
+        }
+        await websocket.send_text(json.dumps({"type": "base_colors", "data": base_colors}))
+        await websocket.send_text(json.dumps({"type": "todos", "data": store.get_todos()}))
+        await websocket.send_text(json.dumps({"type": "rules", "data": rules.list_all()}))
+        with _hat_lock:
+            hats_snapshot = copy.deepcopy(agent_hats)
+        await websocket.send_text(json.dumps({"type": "hats", "data": hats_snapshot}))
+        await websocket.send_text(json.dumps({"type": "jobs", "data": jobs.list_all()}))
+        await websocket.send_text(json.dumps({"type": "schedules", "data": schedules.list_all()}))
+        if registry:
+            for inst in registry.get_all().values():
+                if inst.get("state") == "pending":
+                    await websocket.send_text(json.dumps({
+                        "type": "pending_instance",
+                        "name": inst["name"],
+                        "base": inst.get("base", ""),
+                        "label": inst.get("label", inst["name"]),
+                        "color": inst.get("color", "#888"),
+                    }))
+        for msg in history:
+            await websocket.send_text(json.dumps({
+                "type": "message", "data": msg,
+                "catalogue_revision": revision,
+            }))
 
     # Send status
     await broadcast_status()
@@ -1119,6 +2097,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 if not text and not attachments:
                     continue
+                validation_error = channel_name_error(channel)
+                if validation_error:
+                    await _send_ws_channel_error(websocket, "message", validation_error)
+                    continue
 
                 # Command handling
                 if text.startswith("/"):
@@ -1127,6 +2109,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     if cmd == "/clear":
                         store.clear(channel=channel)
                         await broadcast_clear(channel=channel)
+                        continue
+                    _added, admission_error = _admit_message_channel(channel)
+                    if admission_error:
+                        await _send_ws_channel_error(websocket, "message", admission_error)
                         continue
                     if cmd == "/continue":
                         router.continue_routing()
@@ -1144,22 +2130,30 @@ async def websocket_endpoint(websocket: WebSocket):
                 if reply_to is not None:
                     reply_to = int(reply_to)
 
-                store.add(sender, text, attachments=attachments, reply_to=reply_to,
-                          channel=channel)
+                _msg, admission_error = store_channel_message(
+                    sender,
+                    text,
+                    attachments=attachments,
+                    reply_to=reply_to,
+                    channel=channel,
+                )
+                if admission_error:
+                    await _send_ws_channel_error(websocket, "message", admission_error)
 
             elif event.get("type") == "delete":
                 ids = event.get("ids", [])
                 if ids:
-                    deleted = store.delete([int(i) for i in ids])
-                    if deleted:
-                        data = json.dumps({"type": "delete", "ids": deleted})
-                        dead = set()
-                        for client in list(ws_clients):
-                            try:
-                                await client.send_text(data)
-                            except Exception:
-                                dead.add(client)
-                        ws_clients.difference_update(dead)
+                    async with _channel_outbound_lock:
+                        deleted = store.delete([int(i) for i in ids])
+                        if deleted:
+                            data = json.dumps({"type": "delete", "ids": deleted})
+                            dead = set()
+                            for client in list(ws_clients):
+                                try:
+                                    await client.send_text(data)
+                                except Exception:
+                                    dead.add(client)
+                            ws_clients.difference_update(dead)
                 continue
 
             elif event.get("type") == "todo_add":
@@ -1196,22 +2190,30 @@ async def websocket_endpoint(websocket: WebSocket):
                 reason = event.get("reason", "")
                 is_human = author.lower() == room_settings.get("username", "user").lower()
                 if text:
-                    rule = rules.propose(text, author, reason)
-                    if rule:
-                        if is_human:
-                            # Human-created rules go straight to draft, no card
-                            rules.make_draft(rule["id"])
-                        else:
-                            # Agent proposals get a card in the timeline
-                            channel = event.get("channel", "general")
-                            msg = store.add(
-                                author, f"Rule proposal: {text}",
-                                msg_type="rule_proposal",
-                                channel=channel,
-                                metadata={"rule_id": rule["id"], "text": text, "status": "pending"},
-                            )
-                            # store.add() fires _on_store_message → broadcast already.
-                            # Do NOT call broadcast(msg) again here.
+                    channel = event.get("channel", "general")
+                    try:
+                        rule_state, added, admission_error = _run_channel_state_transaction(
+                            channel,
+                            lambda: _create_rule_proposal_state(
+                                text, author, reason, channel, is_human=is_human,
+                            ),
+                            compensator=_rollback_rule_proposal_state,
+                        )
+                    except Exception:
+                        log.exception("rule proposal failed after channel reservation")
+                        await _send_ws_channel_error(
+                            websocket, "rule_propose", "could not create rule proposal",
+                        )
+                        continue
+                    if admission_error:
+                        await _send_ws_channel_error(websocket, "rule_propose", admission_error)
+                        continue
+                    if rule_state is None:
+                        await _send_ws_channel_error(
+                            websocket, "rule_propose", "too many rules",
+                        )
+                        continue
+                    await _publish_channel_transaction(channel, added)
                 continue
 
             elif event.get("type") in ("decision_approve", "rule_activate"):
@@ -1260,44 +2262,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif event.get("type") == "update_settings":
                 new = event.get("data", {})
-                if "title" in new and isinstance(new["title"], str):
-                    room_settings["title"] = new["title"].strip() or "agentchattr"
-                if "username" in new and isinstance(new["username"], str):
-                    room_settings["username"] = new["username"].strip() or "user"
-                if "font" in new and new["font"] in ("mono", "serif", "sans"):
-                    room_settings["font"] = new["font"]
-                if "max_agent_hops" in new:
-                    try:
-                        hops = int(new["max_agent_hops"])
-                        hops = max(1, min(hops, 50))
-                        room_settings["max_agent_hops"] = hops
-                        router.max_hops = hops
-                    except (ValueError, TypeError):
-                        pass
-                if "contrast" in new and new["contrast"] in ("normal", "high"):
-                    room_settings["contrast"] = new["contrast"]
-                if "rules_refresh_interval" in new:
-                    try:
-                        ri = int(new["rules_refresh_interval"])
-                        room_settings["rules_refresh_interval"] = max(0, min(ri, 100))
-                    except (ValueError, TypeError):
-                        pass
-                if "history_limit" in new:
-                    val = str(new["history_limit"]).strip().lower()
-                    if val == "all":
-                        room_settings["history_limit"] = "all"
-                    else:
-                        try:
-                            val_int = int(val)
-                            room_settings["history_limit"] = max(1, min(val_int, 10000))
-                        except (ValueError, TypeError):
-                            pass
-                if "custom_roles" in new and isinstance(new["custom_roles"], list):
-                    room_settings["custom_roles"] = [
-                        str(r).strip()[:20] for r in new["custom_roles"]
-                        if isinstance(r, str) and r.strip()
-                    ][:20]
-                _save_settings()
+                _apply_room_settings_update(new)
                 await broadcast_settings()
 
             elif event.get("type") == "rename_agent":
@@ -1373,59 +2338,109 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             elif event.get("type") == "channel_create":
-                name = (event.get("name") or "").strip().lower()
-                if not name or not _CHANNEL_NAME_RE.match(name):
+                raw_name = event.get("name", "")
+                name = raw_name.strip().lower() if isinstance(raw_name, str) else raw_name
+                validation_error = channel_name_error(name)
+                if validation_error:
+                    await _send_ws_channel_error(websocket, "channel_create", validation_error)
                     continue
-                if name in room_settings["channels"]:
+                with _channel_catalog_lock:
+                    settings_before = _settings_snapshot_locked()
+                    pending_before = set(_catalogue_broadcast_pending)
+                    channels = room_settings.setdefault("channels", ["general"])
+                    if name in channels:
+                        admission_error = f"channel '{name}' already exists"
+                        _added = False
+                    else:
+                        manual_limit = min(
+                            room_settings.get("max_channels", DEFAULT_MAX_CHANNELS),
+                            _channel_discovery_limit(),
+                        )
+                        if len(channels) >= manual_limit:
+                            admission_error = f"manual channel limit reached ({manual_limit})"
+                            _added = False
+                        else:
+                            _added, admission_error = _admit_message_channel(
+                                name, persist=False,
+                            )
+                            if _added:
+                                try:
+                                    _save_settings()
+                                except Exception:
+                                    room_settings.clear()
+                                    room_settings.update(settings_before)
+                                    _catalogue_broadcast_pending.clear()
+                                    _catalogue_broadcast_pending.update(pending_before)
+                                    admission_error = "could not persist channel catalogue"
+                                    _added = False
+                if admission_error:
+                    await _send_ws_channel_error(websocket, "channel_create", admission_error)
                     continue
-                if len(room_settings["channels"]) >= MAX_CHANNELS:
-                    continue
-                room_settings["channels"].append(name)
-                _save_settings()
+                with _channel_catalog_lock:
+                    _catalogue_broadcast_pending.discard(name)
                 await broadcast_settings()
 
             elif event.get("type") == "channel_rename":
-                old_name = (event.get("old_name") or "").strip().lower()
-                new_name = (event.get("new_name") or "").strip().lower()
+                raw_old_name = event.get("old_name", "")
+                raw_new_name = event.get("new_name", "")
+                old_name = raw_old_name.strip().lower() if isinstance(raw_old_name, str) else raw_old_name
+                new_name = raw_new_name.strip().lower() if isinstance(raw_new_name, str) else raw_new_name
+                old_validation_error = channel_name_error(old_name)
+                if old_validation_error:
+                    await _send_ws_channel_error(
+                        websocket, "channel_rename", old_validation_error,
+                    )
+                    continue
                 if old_name == "general":
+                    await _send_ws_channel_error(
+                        websocket, "channel_rename", "the general channel cannot be renamed",
+                        restore_channel=old_name,
+                    )
                     continue
-                if not new_name or not _CHANNEL_NAME_RE.match(new_name):
+                validation_error = channel_name_error(new_name)
+                if validation_error:
+                    await _send_ws_channel_error(
+                        websocket, "channel_rename", validation_error,
+                        restore_channel=old_name,
+                    )
                     continue
-                if old_name not in room_settings["channels"]:
+                renamed, rename_error = await _rename_channel_and_broadcast(
+                    old_name, new_name,
+                )
+                if not renamed:
+                    await _send_ws_channel_error(
+                        websocket, "channel_rename", rename_error or "rename rejected",
+                        restore_channel=old_name,
+                    )
                     continue
-                if new_name in room_settings["channels"]:
-                    continue
-                idx = room_settings["channels"].index(old_name)
-                room_settings["channels"][idx] = new_name
-                store.rename_channel(old_name, new_name)
-                import mcp_bridge
-                mcp_bridge.migrate_cursors_rename(old_name, new_name)
-                _save_settings()
-                await broadcast_settings()
-                # Tell clients to migrate DOM elements
-                rename_event = json.dumps({
-                    "type": "channel_renamed",
-                    "old_name": old_name,
-                    "new_name": new_name,
-                })
-                for c in list(ws_clients):
-                    try:
-                        await c.send_text(rename_event)
-                    except Exception:
-                        pass
 
             elif event.get("type") == "channel_delete":
-                name = (event.get("name") or "").strip().lower()
-                if name == "general":
+                raw_name = event.get("name", "")
+                name = raw_name.strip().lower() if isinstance(raw_name, str) else raw_name
+                validation_error = channel_name_error(name)
+                if validation_error:
+                    await _send_ws_channel_error(websocket, "channel_delete", validation_error)
                     continue
-                if name not in room_settings["channels"]:
+                async with _channel_outbound_lock:
+                    deleted, delete_error = _delete_catalogued_channel(name)
+                    if deleted:
+                        import mcp_bridge
+                        try:
+                            mcp_bridge.migrate_cursors_delete(name)
+                        except Exception:
+                            log.exception("could not migrate MCP cursors for deleted channel %s", name)
+                        snapshot = _settings_snapshot()
+                        await _broadcast_channel_payload_locked({
+                            "type": "settings",
+                            "data": snapshot,
+                            "catalogue_revision": snapshot["catalogue_revision"],
+                        })
+                if not deleted:
+                    await _send_ws_channel_error(
+                        websocket, "channel_delete", delete_error or "delete rejected",
+                        restore_channel=name,
+                    )
                     continue
-                room_settings["channels"].remove(name)
-                store.delete_channel(name)
-                import mcp_bridge
-                mcp_bridge.migrate_cursors_delete(name)
-                _save_settings()
-                await broadcast_settings()
 
     except WebSocketDisconnect:
         ws_clients.discard(websocket)
@@ -1466,6 +2481,80 @@ async def upload_image(file: UploadFile = File(...)):
 
 # --- Export / Import ---
 
+def _snapshot_import_stores():
+    """Capture all archive-mutated stores for fail-closed rollback."""
+    def file_state(path: Path):
+        return (True, path.read_bytes()) if path.exists() else (False, b"")
+
+    snapshot = {"message_store": store.snapshot_state()}
+    with jobs._lock:
+        snapshot["jobs"] = copy.deepcopy(jobs._jobs)
+        snapshot["job_next_id"] = jobs._next_id
+        snapshot["jobs_file"] = file_state(jobs._path)
+    with rules._lock:
+        snapshot["rules"] = copy.deepcopy(rules._rules)
+        snapshot["rule_next_id"] = rules._next_id
+        snapshot["rule_epoch"] = rules._epoch
+        snapshot["rule_agent_sync"] = copy.deepcopy(rules._agent_sync)
+        snapshot["rules_file"] = file_state(rules._path)
+    with summaries._lock:
+        snapshot["summaries"] = copy.deepcopy(summaries._summaries)
+        snapshot["summaries_file"] = file_state(summaries._path)
+    return snapshot
+
+
+def _restore_import_stores(snapshot):
+    """Restore an archive snapshot in memory and durably, or raise."""
+    def restore_file(path: Path, state):
+        existed, content = state
+        if existed:
+            _atomic_write_bytes(path, content)
+        else:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    current = _snapshot_import_stores()
+    try:
+        # Restore every file first, then publish matching memory.  On a
+        # transient failure the except branch restores the complete current
+        # state rather than leaving a mixed pre/post-import view.
+        store.restore_state(snapshot["message_store"])
+        restore_file(jobs._path, snapshot["jobs_file"])
+        restore_file(rules._path, snapshot["rules_file"])
+        restore_file(summaries._path, snapshot["summaries_file"])
+        with jobs._lock:
+            jobs._jobs = copy.deepcopy(snapshot["jobs"])
+            jobs._next_id = snapshot["job_next_id"]
+        with rules._lock:
+            rules._rules = copy.deepcopy(snapshot["rules"])
+            rules._next_id = snapshot["rule_next_id"]
+            rules._epoch = snapshot["rule_epoch"]
+            rules._agent_sync = copy.deepcopy(snapshot["rule_agent_sync"])
+        with summaries._lock:
+            summaries._summaries = copy.deepcopy(snapshot["summaries"])
+    except Exception:
+        try:
+            store.restore_state(current["message_store"])
+            restore_file(jobs._path, current["jobs_file"])
+            restore_file(rules._path, current["rules_file"])
+            restore_file(summaries._path, current["summaries_file"])
+            with jobs._lock:
+                jobs._jobs = current["jobs"]
+                jobs._next_id = current["job_next_id"]
+            with rules._lock:
+                rules._rules = current["rules"]
+                rules._next_id = current["rule_next_id"]
+                rules._epoch = current["rule_epoch"]
+                rules._agent_sync = current["rule_agent_sync"]
+            with summaries._lock:
+                summaries._summaries = current["summaries"]
+        except Exception:
+            log.exception("could not restore current stores after rollback failure")
+        raise
+
+
 @app.get("/api/export")
 async def export_history():
     """Download a zip archive of project history."""
@@ -1489,6 +2578,7 @@ async def export_history():
 @app.post("/api/import")
 async def import_history(file: UploadFile = File(...)):
     """Upload a zip archive and merge it into current stores."""
+    global _structured_broadcast_suspended
     import archive as _archive
     if not file.filename or not file.filename.lower().endswith(".zip"):
         return JSONResponse({"error": "unsupported file type: expected .zip"}, status_code=400)
@@ -1498,20 +2588,70 @@ async def import_history(file: UploadFile = File(...)):
             {"error": f"file too large (max {_archive.MAX_IMPORT_SIZE // 1024 // 1024}MB)"},
             status_code=400,
         )
-    channel_list = list(room_settings.get("channels", ["general"]))
-    max_ch = room_settings.get("max_channels", 8)
-    report = _archive.import_archive(
-        content, store, jobs, rules, summaries,
-        channel_list, max_channels=max_ch,
-    )
+    archive_channels, inspection_error = _archive.inspect_archive_channels(content)
+    if inspection_error:
+        return JSONResponse({"error": inspection_error}, status_code=400)
+    for archive_channel in archive_channels:
+        validation_error = channel_name_error(archive_channel)
+        if validation_error:
+            return JSONResponse(
+                {"error": f"archive channel {archive_channel!r}: {validation_error}"},
+                status_code=400,
+            )
+
+    # Keep catalogue admission and the synchronous archive merge in one lock
+    # window. Lock order is catalogue -> stores, matching message/delete paths.
+    with _channel_catalog_lock:
+        settings_before = _settings_snapshot_locked()
+        pending_before = set(_catalogue_broadcast_pending)
+        channel_list = list(room_settings.get("channels", ["general"]))
+        max_ch = _channel_discovery_limit()
+        new_channels = [ch for ch in archive_channels if ch not in channel_list]
+        if len(channel_list) + len(new_channels) > max_ch:
+            return JSONResponse(
+                {"error": f"archive needs {len(new_channels)} new channels but catalogue "
+                          f"has only {max_ch - len(channel_list)} free slots"},
+                status_code=409,
+            )
+        # All archive stores use RLocks.  Holding them as one mutation barrier
+        # prevents a legitimate concurrent direct write from being erased by
+        # rollback while import helpers safely re-enter on this thread.
+        with store._lock, jobs._lock, rules._lock, summaries._lock:
+            store_snapshot = _snapshot_import_stores()
+            _structured_broadcast_suspended += 1
+            try:
+                report = _archive.import_archive(
+                    content, store, jobs, rules, summaries,
+                    channel_list, max_channels=max_ch,
+                )
+                if not report.get("ok"):
+                    _restore_import_stores(store_snapshot)
+                elif report["channels"]["created"]:
+                    room_settings["channels"] = channel_list
+                    _bump_catalogue_revision_locked()
+                    _save_settings()
+            except Exception as exc:
+                try:
+                    _restore_import_stores(store_snapshot)
+                    room_settings.clear()
+                    room_settings.update(settings_before)
+                    _catalogue_broadcast_pending.clear()
+                    _catalogue_broadcast_pending.update(pending_before)
+                except Exception:
+                    # Rollback could not be made durable. Keep every discovered
+                    # channel visible in memory; restart reconciliation rebuilds
+                    # the same fail-closed catalogue from whichever records remain.
+                    log.exception("archive rollback failed; retaining imported channels fail-closed")
+                    room_settings["channels"] = channel_list
+                log.exception("archive import transaction failed")
+                return JSONResponse({"error": f"import failed: {exc}"}, status_code=500)
+            finally:
+                _structured_broadcast_suspended -= 1
     if not report.get("ok"):
         error = report.get("error", "import failed")
         status = 409 if "already running" in error else 400
         return JSONResponse({"error": error}, status_code=status)
-    # Update channel list if new channels were created
     if report["channels"]["created"]:
-        room_settings["channels"] = channel_list
-        _save_settings()
         await broadcast_settings()
     # Tell all connected clients to reload (picks up imported messages)
     data = json.dumps({"type": "reload"})
@@ -1554,21 +2694,184 @@ async def api_send(request: Request):
     if not text:
         return JSONResponse({"error": "text is required"}, status_code=400)
     channel = body.get("channel", "general")
-
-    msg = store.add(sender, text, channel=channel)
+    msg, admission_error = store_channel_message(sender, text, channel=channel)
+    if admission_error:
+        status = 409 if "catalogue is full" in admission_error else 400
+        return JSONResponse({"error": admission_error}, status_code=status)
     return JSONResponse(msg)
+
+
+@app.post("/api/rotate-token/{name}")
+async def api_rotate_token(name: str, request: Request):
+    """Rotate the caller's bearer token (wrapper-restart prerequisite).
+
+    Auth is by possession of the current LIVE token; the rotated identity is
+    the one that OWNS the presented token. The `name` path segment is
+    informational only and never trusted (spoofing another agent's name in the
+    path cannot redirect the rotation). Stale, reclaimable, pending, or
+    unknown tokens fail closed; reclaimable identities are NOT reactivated by
+    this call. The new token is returned exactly once and never logged.
+
+    Auth failures are a single normative 403 (matching the security middleware,
+    which 403s a missing/invalid bearer before this handler — id1098 E1). A
+    durable-persistence failure is a token-free generic 500 (id1097 B1); the
+    success body is EXACTLY {"name","token"} — no retired token, no extra keys
+    (id1098 E3).
+    """
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return JSONResponse({"error": "forbidden: missing or invalid bearer token"}, status_code=403)
+    token = auth[7:].strip()
+    rotated = registry.rotate_token(token) if registry else None
+    if rotated == "persist-failed":
+        return JSONResponse({"error": "internal error: rotation could not be persisted"}, status_code=500)
+    if not isinstance(rotated, dict):
+        return JSONResponse(
+            {"error": "forbidden: token is stale, unknown, or not rotatable"}, status_code=403
+        )
+    return JSONResponse({"name": rotated["name"], "token": rotated["token"]})
+
+
+def _migration_lease_error_response(exc: MigrationLeaseError) -> JSONResponse:
+    return JSONResponse({"error": exc.error}, status_code=exc.status_code)
+
+
+def _migration_lease_bearer(request: Request) -> str:
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        raise MigrationLeaseError(403, "current agent bearer required")
+    token = auth[7:].strip()
+    if not token:
+        raise MigrationLeaseError(403, "current agent bearer required")
+    return token
+
+
+_MIGRATION_LEASE_MAX_BODY_BYTES = 4096
+
+
+def _migration_lease_json_object(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON member")
+        result[key] = value
+    return result
+
+
+def _reject_migration_lease_json_constant(_value: str):
+    raise ValueError("non-finite JSON number")
+
+
+async def _migration_lease_body(request: Request) -> dict:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        if (
+            not content_length
+            or not content_length.isascii()
+            or not content_length.isdigit()
+        ):
+            raise MigrationLeaseError(400, "invalid JSON")
+        if len(content_length) > 20:
+            raise MigrationLeaseError(413, "migration lease request body too large")
+        if int(content_length) > _MIGRATION_LEASE_MAX_BODY_BYTES:
+            raise MigrationLeaseError(413, "migration lease request body too large")
+
+    chunks = []
+    size = 0
+    try:
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > _MIGRATION_LEASE_MAX_BODY_BYTES:
+                raise MigrationLeaseError(
+                    413, "migration lease request body too large"
+                )
+            chunks.append(chunk)
+    except MigrationLeaseError:
+        raise
+    except Exception as exc:
+        raise MigrationLeaseError(400, "invalid JSON") from exc
+
+    raw = b"".join(chunks)
+    try:
+        # json.loads(bytes) auto-detects UTF-16/32; decode explicitly so the
+        # wire contract remains strict UTF-8. A UTF-8 BOM is not accepted.
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raise ValueError("UTF-8 BOM is not allowed")
+        text = raw.decode("utf-8", errors="strict")
+        body = json.loads(
+            text,
+            object_pairs_hook=_migration_lease_json_object,
+            parse_constant=_reject_migration_lease_json_constant,
+        )
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise MigrationLeaseError(400, "invalid JSON") from exc
+    if not isinstance(body, dict):
+        raise MigrationLeaseError(400, "invalid migration lease request shape")
+    return body
+
+
+@app.post("/api/migration-lease/acquire")
+async def acquire_migration_lease(request: Request):
+    """Durably freeze one exact live wrapper identity for a bounded migration."""
+    try:
+        token = _migration_lease_bearer(request)
+        body = await _migration_lease_body(request)
+        if not migration_leases or not registry:
+            raise MigrationLeaseError(503, "migration lease service unavailable")
+        return JSONResponse(migration_leases.acquire(registry, token, body))
+    except MigrationLeaseError as exc:
+        return _migration_lease_error_response(exc)
+
+
+@app.post("/api/migration-lease/renew")
+async def renew_migration_lease(request: Request):
+    """Idempotently extend an unexpired exact-identity migration lease."""
+    try:
+        token = _migration_lease_bearer(request)
+        body = await _migration_lease_body(request)
+        if not migration_leases or not registry:
+            raise MigrationLeaseError(503, "migration lease service unavailable")
+        return JSONResponse(migration_leases.renew(registry, token, body))
+    except MigrationLeaseError as exc:
+        return _migration_lease_error_response(exc)
+
+
+@app.post("/api/migration-lease/release")
+async def release_migration_lease(request: Request):
+    """Durably release a lease, retaining a bounded idempotency tombstone."""
+    try:
+        token = _migration_lease_bearer(request)
+        body = await _migration_lease_body(request)
+        if not migration_leases or not registry:
+            raise MigrationLeaseError(503, "migration lease service unavailable")
+        return JSONResponse(migration_leases.release(registry, token, body))
+    except MigrationLeaseError as exc:
+        return _migration_lease_error_response(exc)
+
+
+@app.get("/api/migration-lease/status/{lease_nonce}")
+async def migration_lease_status(lease_nonce: str, request: Request):
+    """Reconcile a lost acquire/release response using the current bearer."""
+    try:
+        token = _migration_lease_bearer(request)
+        if not migration_leases or not registry:
+            raise MigrationLeaseError(503, "migration lease service unavailable")
+        return JSONResponse(migration_leases.status(registry, token, lease_nonce))
+    except MigrationLeaseError as exc:
+        return _migration_lease_error_response(exc)
 
 
 @app.get("/api/status")
 async def get_status():
     status = agents.get_status()
-    status["paused"] = any(router.is_paused(ch) for ch in room_settings.get("channels", ["general"]))
+    channels = _settings_snapshot().get("channels", ["general"])
+    status["paused"] = any(router.is_paused(ch) for ch in channels)
     return status
 
 
 @app.get("/api/settings")
 async def get_settings():
-    return room_settings
+    return _settings_snapshot()
 
 
 @app.delete("/api/hat/{agent_name}")
@@ -1609,12 +2912,24 @@ async def create_schedule(request: Request):
             send_at = dt.timestamp()
         except ValueError:
             pass
-    s = schedules.create(
-        prompt=prompt, targets=targets, channel=channel,
-        interval_seconds=interval_sec, daily_at=daily_at,
-        one_shot=one_shot, send_at=send_at,
-        created_by=created_by,
-    )
+    try:
+        s, added, channel_error = _run_channel_state_transaction(
+            channel,
+            lambda: schedules.create(
+                prompt=prompt, targets=targets, channel=channel,
+                interval_seconds=interval_sec, daily_at=daily_at,
+                one_shot=one_shot, send_at=send_at,
+                created_by=created_by,
+            ),
+            compensator=lambda created: schedules.delete(created["id"]),
+        )
+    except Exception:
+        log.exception("schedule creation failed after channel reservation")
+        return JSONResponse({"error": "could not create schedule"}, status_code=500)
+    if channel_error:
+        status = 409 if "catalogue is full" in channel_error else 400
+        return JSONResponse({"error": channel_error}, status_code=status)
+    await _publish_channel_transaction(channel, added)
     return JSONResponse(s)
 
 
@@ -1651,7 +2966,7 @@ async def demote_proposal(msg_id: int):
     msg_type = msg.get("type")
     if msg_type not in {"job_proposal", "session_draft"}:
         return JSONResponse({"error": "not a proposal"}, status_code=400)
-    meta = msg.get("metadata", {})
+    meta = copy.deepcopy(msg.get("metadata") or {})
     updated_fields = {"type": "chat", "metadata": {}}
 
     if msg_type == "job_proposal":
@@ -1716,46 +3031,11 @@ async def resolve_decision(msg_id: int, request: Request):
     chosen = body.get("choice", "")
     if not chosen:
         return JSONResponse({"error": "choice is required"}, status_code=400)
-    # Atomic check + resolve under lock to prevent double-click race
-    error = None
-    channel = "general"
-    sender = ""
-    with store._lock:
-        msg = None
-        for m in store._messages:
-            if m["id"] == msg_id:
-                msg = m
-                break
-        if not msg:
-            error = ("message not found", 404)
-        elif msg.get("type") != "decision":
-            error = ("not a decision message", 400)
-        else:
-            meta = msg.get("metadata") or {}
-            if meta.get("resolved"):
-                error = ("already resolved", 400)
-            else:
-                valid_choices = meta.get("choices", [])
-                if valid_choices and chosen not in valid_choices:
-                    error = (f"invalid choice. Valid: {valid_choices}", 400)
-                else:
-                    meta["resolved"] = True
-                    meta["chosen"] = chosen
-                    msg["metadata"] = meta
-                    channel = msg.get("channel", "general")
-                    sender = msg.get("sender", "")
-                    store._rewrite()
+    username = room_settings.get("username", "user")
+    updated, _reply, error = store.resolve_decision(msg_id, chosen, username)
     if error:
         return JSONResponse({"error": error[0]}, status_code=error[1])
-    # Post the chosen answer as a regular chat message tagged @sender
-    username = room_settings.get("username", "user")
-    reply_text = f"@{sender} {chosen}" if sender else chosen
-    try:
-        store.add(username, reply_text, reply_to=msg_id, channel=channel)
-    except Exception:
-        import traceback; traceback.print_exc()
     # Broadcast updated decision card so the UI swaps buttons to resolved state
-    updated = store.get_by_id(msg_id)
     if updated:
         await _broadcast(json.dumps({"type": "message_update", "message": updated}))
     return {"ok": True, "chosen": chosen}
@@ -1771,22 +3051,43 @@ async def resolve_rule_proposal(msg_id: int, request: Request):
         return JSONResponse({"error": "not a rule proposal"}, status_code=400)
     body = await request.json()
     action = body.get("action", "")
-    meta = msg.get("metadata", {})
+    meta = copy.deepcopy(msg.get("metadata") or {})
     rule_id = meta.get("rule_id")
-
-    if action == "activate" and rule_id is not None:
-        rules.activate(int(rule_id))
-        meta["status"] = "activated"
-    elif action == "draft" and rule_id is not None:
-        rules.make_draft(int(rule_id))
-        meta["status"] = "drafted"
-    elif action == "dismiss" and rule_id is not None:
-        rules.delete(int(rule_id))
-        meta["status"] = "dismissed"
-    else:
+    if action not in {"activate", "draft", "dismiss"} or rule_id is None:
         return JSONResponse({"error": "invalid action"}, status_code=400)
 
-    updated = store.update_message(msg_id, {"metadata": meta})
+    def _resolve():
+        with rules._lock:
+            snapshot = rules.snapshot_state()
+            try:
+                if action == "activate":
+                    rule_result = rules.activate(int(rule_id), _notify=False)
+                    status = "activated"
+                    event_action = "activate"
+                elif action == "draft":
+                    rule_result = rules.make_draft(int(rule_id), _notify=False)
+                    status = "drafted"
+                    event_action = "edit"
+                else:
+                    rule_result = rules.delete(int(rule_id), _notify=False)
+                    status = "dismissed"
+                    event_action = "delete"
+                if rule_result is None:
+                    return None, None, None
+                updated_meta = copy.deepcopy(meta)
+                updated_meta["status"] = status
+                result = store.update_message(msg_id, {"metadata": updated_meta})
+                if result is None:
+                    raise RuntimeError("rule proposal message disappeared")
+                return result, event_action, rule_result
+            except Exception:
+                rules.restore_state(snapshot)
+                raise
+
+    updated, event_action, rule_result = _run_buffered_store_transaction(_resolve)
+    if updated is None:
+        return JSONResponse({"error": "rule state could not be changed"}, status_code=409)
+    rules._fire(event_action, rule_result)
     if updated:
         # Broadcast the updated message so all clients re-render the card
         payload = json.dumps({"type": "edit", "message": updated})
@@ -1808,16 +3109,32 @@ async def demote_rule_proposal(msg_id: int):
         return JSONResponse({"error": "message not found"}, status_code=404)
     if msg.get("type") != "rule_proposal":
         return JSONResponse({"error": "not a rule proposal"}, status_code=400)
-    meta = msg.get("metadata", {})
+    meta = copy.deepcopy(msg.get("metadata") or {})
     rule_id = meta.get("rule_id")
-    if rule_id is not None:
-        rules.delete(int(rule_id))
     text = meta.get("text", msg.get("text", ""))
-    updated = store.update_message(msg_id, {
-        "type": "chat",
-        "text": text,
-        "metadata": {},
-    })
+
+    def _demote():
+        with rules._lock:
+            snapshot = rules.snapshot_state()
+            try:
+                removed_rule = None
+                if rule_id is not None:
+                    removed_rule = rules.delete(int(rule_id), _notify=False)
+                result = store.update_message(msg_id, {
+                    "type": "chat",
+                    "text": text,
+                    "metadata": {},
+                })
+                if result is None:
+                    raise RuntimeError("rule proposal message disappeared")
+                return result, removed_rule
+            except Exception:
+                rules.restore_state(snapshot)
+                raise
+
+    updated, removed_rule = _run_buffered_store_transaction(_demote)
+    if removed_rule is not None:
+        rules._fire("delete", removed_rule)
     if updated:
         payload = json.dumps({"type": "edit", "message": updated})
         dead = set()
@@ -1840,6 +3157,10 @@ async def trigger_agent_silent(request: Request):
     source_msg_id = body.get("source_msg_id")
     if not agent_name or not message:
         return JSONResponse({"error": "agent and message required"}, status_code=400)
+    _added, channel_error = await _admit_channel_ingress(channel)
+    if channel_error:
+        status = 409 if "catalogue is full" in channel_error else 400
+        return JSONResponse({"error": channel_error}, status_code=status)
 
     custom_prompt = body.get("prompt", "").strip()
     if not custom_prompt:
@@ -1860,10 +3181,29 @@ async def trigger_agent_silent(request: Request):
         resolved = registry.resolve_to_instances(agent_name)
         if resolved:
             targets = resolved
+    source_ref = source_msg_id
+    if source_ref is None:
+        source_ref = body.get("request_id")
+    if source_ref is None:
+        # Backward-compatible deterministic retry key for callers which have
+        # not yet adopted request_id.  Explicit request_id remains preferred
+        # when two intentionally separate requests have identical content.
+        source_ref = json.dumps(
+            [channel, message, custom_prompt],
+            ensure_ascii=True, separators=(",", ":"),
+        )
+    action_ids = {}
     for target in targets:
         if agents.is_available(target):
-            await agents.trigger(target, message=message, channel=channel, prompt=custom_prompt)
-    return {"ok": True, "triggered": targets}
+            action_id = agents.action_id_for(
+                "trigger-agent", source_ref, target
+            )
+            action_ids[target] = action_id
+            await agents.trigger(
+                target, message=message, channel=channel,
+                prompt=custom_prompt, action_id=action_id,
+            )
+    return {"ok": True, "triggered": targets, "action_ids": action_ids}
 
 
 @app.post("/api/jobs")
@@ -1879,30 +3219,82 @@ async def create_job(request: Request):
     anchor_msg_id = body.get("anchor_msg_id")
     assignee = body.get("assignee", "")
     job_body = body.get("body", "")
-    result = jobs.create(
-        title=title, job_type=job_type, channel=channel,
-        created_by=created_by, anchor_msg_id=anchor_msg_id,
-        assignee=assignee, body=job_body,
-    )
-    # Mark the proposal message as accepted so it persists across refresh
-    if anchor_msg_id:
-        anchor_msg = store.get_by_id(anchor_msg_id)
-        if anchor_msg and anchor_msg.get("type") == "job_proposal":
-            meta = dict(anchor_msg.get("metadata", {}))
-            meta["status"] = "accepted"
-            updated_msg = store.update_message(anchor_msg_id, {"metadata": meta})
-            if updated_msg:
-                payload = json.dumps({"type": "edit", "message": updated_msg})
-                dead = set()
-                for client in list(ws_clients):
-                    try:
-                        await client.send_text(payload)
-                    except Exception:
-                        dead.add(client)
-                ws_clients.difference_update(dead)
-    # Post breadcrumb in main timeline with job_id for clickable link
-    store.add(created_by, f"Job created: {title}", msg_type="job_created",
-              channel=channel, metadata={"job_id": result["id"]})
+
+    def _rollback_job_state(state):
+        if not state:
+            return
+        breadcrumb = state.get("breadcrumb")
+        if breadcrumb is not None:
+            store.delete([breadcrumb["id"]])
+        if state.get("anchor_updated"):
+            store.restore_message(state["anchor_before"])
+        created = state.get("job")
+        if created is not None:
+            jobs.delete(created["id"])
+
+    def _create_job_state():
+        state = {
+            "job": None,
+            "anchor_id": anchor_msg_id,
+            "anchor_before": None,
+            "anchor_updated": False,
+            "updated_anchor": None,
+            "breadcrumb": None,
+        }
+        try:
+            created = jobs.create(
+                title=title, job_type=job_type, channel=channel,
+                created_by=created_by, anchor_msg_id=anchor_msg_id,
+                assignee=assignee, body=job_body,
+            )
+            state["job"] = created
+            if anchor_msg_id is not None:
+                anchor_msg = store.get_by_id(anchor_msg_id)
+                if anchor_msg and anchor_msg.get("type") == "job_proposal":
+                    state["anchor_before"] = copy.deepcopy(anchor_msg)
+                    meta = copy.deepcopy(anchor_msg.get("metadata") or {})
+                    meta["status"] = "accepted"
+                    state["updated_anchor"] = store.update_message(
+                        anchor_msg_id, {"metadata": meta},
+                    )
+                    state["anchor_updated"] = state["updated_anchor"] is not None
+            breadcrumb, write_error = store_channel_message(
+                created_by,
+                f"Job created: {title}",
+                msg_type="job_created",
+                channel=channel,
+                metadata={"job_id": created["id"]},
+            )
+            if write_error:
+                raise RuntimeError(write_error)
+            state["breadcrumb"] = breadcrumb
+            return state
+        except Exception:
+            _rollback_mutation_state(state, _rollback_job_state)
+            raise
+
+    try:
+        transaction_result, added, channel_error = _run_channel_state_transaction(
+            channel, _create_job_state, compensator=_rollback_job_state,
+        )
+    except Exception:
+        log.exception("job creation failed after channel reservation")
+        return JSONResponse({"error": "could not create job"}, status_code=500)
+    if channel_error:
+        status = 409 if "catalogue is full" in channel_error else 400
+        return JSONResponse({"error": channel_error}, status_code=status)
+    result = transaction_result["job"]
+    updated_msg = transaction_result["updated_anchor"]
+    await _publish_channel_transaction(channel, added)
+    if updated_msg:
+        payload = json.dumps({"type": "edit", "message": updated_msg})
+        dead = set()
+        for client in list(ws_clients):
+            try:
+                await client.send_text(payload)
+            except Exception:
+                dead.add(client)
+        ws_clients.difference_update(dead)
     return result
 
 
@@ -1979,8 +3371,12 @@ async def post_job_message(job_id: int, request: Request):
                 if inst and inst.get("state") == "pending":
                     continue
             if agents.is_available(target):
-                await agents.trigger(target, message=chat_msg, channel=channel,
-                                     job_id=job_id)
+                await agents.trigger(
+                    target, message=chat_msg, channel=channel, job_id=job_id,
+                    action_id=agents.action_id_for(
+                        "job-message", f"{job_id}:{msg['id']}", target
+                    ),
+                )
 
     return msg
 
@@ -2005,18 +3401,26 @@ async def resolve_job_message(job_id: int, msg_index: int, request: Request):
     msgs = job.get("messages", [])
     if msg_index < 0 or msg_index >= len(msgs):
         return JSONResponse({"error": "invalid message index"}, status_code=400)
-    msg = msgs[msg_index]
-    msg["resolved"] = resolution
-    jobs._save()
+    resolved_job = jobs.resolve_message(job_id, msg_index, resolution)
+    if resolved_job is None:
+        return JSONResponse({"error": "message not found"}, status_code=404)
+    msg = resolved_job.get("messages", [])[msg_index]
 
     # If accepted, trigger the suggesting agent with context
     if resolution == "accepted" and msg.get("sender"):
         agent_name = msg["sender"]
-        channel = job.get("channel", "general")
+        channel = resolved_job.get("channel", "general")
         if agents.is_available(agent_name):
-            await agents.trigger(agent_name,
-                                 message=f"Your suggestion was accepted: {msg.get('text', '')}",
-                                 channel=channel, job_id=job_id)
+            await agents.trigger(
+                agent_name,
+                message=f"Your suggestion was accepted: {msg.get('text', '')}",
+                channel=channel, job_id=job_id,
+                action_id=agents.action_id_for(
+                    "job-resolution",
+                    f"{job_id}:{msg.get('id', msg_index)}:{resolution}",
+                    agent_name,
+                ),
+            )
 
     return {"ok": True, "resolution": resolution}
 
@@ -2118,6 +3522,9 @@ async def register_agent(request: Request):
     result = registry.register(base, label)
     if result is None:
         return JSONResponse({"error": f"unknown base: {base}"}, status_code=400)
+    if isinstance(result, str):
+        status = 503 if result == "migration_lease_store_unhealthy" else 409
+        return JSONResponse({"error": result}, status_code=status)
     # Touch presence so the instance doesn't immediately time out
     import mcp_bridge
     with mcp_bridge._presence_lock:
@@ -2163,6 +3570,10 @@ async def deregister_agent(name: str, request: Request):
     result = registry.deregister(name)
     if result is None:
         return JSONResponse({"error": "not found"}, status_code=404)
+    if not result.get("ok"):
+        error = result.get("error", "deregister rejected")
+        status = 503 if error == "migration_lease_store_unhealthy" else 409
+        return JSONResponse({"error": error}, status_code=status)
     # Clean up runtime state (presence, activity, cursors, rename chains)
     import mcp_bridge
     mcp_bridge.purge_identity(name)
@@ -2369,11 +3780,19 @@ async def start_session(request: Request):
     cast = body.get("cast", {})
     goal = body.get("goal", "")
     started_by = body.get("started_by", "user")
+    channel_error = channel_name_error(channel)
+    if channel_error:
+        return JSONResponse({"error": channel_error}, status_code=400)
 
     # If running from a draft, load the inline template from message metadata
     tmpl = None
-    if draft_message_id:
-        draft_msg = store.get_by_id(int(draft_message_id))
+    temporary_template = False
+    if draft_message_id is not None:
+        try:
+            draft_id = int(draft_message_id)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "invalid draft message id"}, status_code=400)
+        draft_msg = store.get_by_id(draft_id)
         if not draft_msg:
             return JSONResponse({"error": "draft message not found"}, status_code=404)
         meta = draft_msg.get("metadata", {})
@@ -2382,19 +3801,36 @@ async def start_session(request: Request):
         tmpl = meta.get("template")
         if not tmpl:
             return JSONResponse({"error": "draft has no template"}, status_code=400)
-        # Register as a temporary template
-        template_id = tmpl.get("id", f"draft-{draft_message_id}")
+        tmpl = dict(tmpl)
+        # A draft gets a runtime-unique template id so it cannot shadow a
+        # built-in or saved custom template with the same inline id.
+        template_id = f"draft-{draft_id}"
         tmpl["id"] = template_id
-        tmpl["is_custom"] = True
-        session_store._templates[template_id] = tmpl
+        temporary_template = True
 
     # Validate template exists
     if not tmpl:
         tmpl = session_store.get_template(template_id)
     if not tmpl:
         return JSONResponse({"error": f"unknown template: {template_id}"}, status_code=400)
+    try:
+        template_errors = validate_session_template(tmpl)
+    except (TypeError, ValueError):
+        template_errors = ["roles and phases contain invalid values"]
+    roles = tmpl.get("roles", [])
+    if not isinstance(roles, list) or any(
+        not isinstance(role, str) or not role.strip() for role in roles
+    ):
+        template_errors.append("roles must be non-empty strings")
+    if template_errors:
+        return JSONResponse(
+            {"error": "invalid template: " + "; ".join(template_errors)},
+            status_code=400,
+        )
 
     # Auto-fill cast from available agents if not fully provided
+    if not isinstance(cast, dict):
+        return JSONResponse({"error": "cast must be an object"}, status_code=400)
     if not cast:
         online = registry.get_active_names() if registry else []
         roles = tmpl.get("roles", [])
@@ -2404,20 +3840,79 @@ async def start_session(request: Request):
                 {"error": "not enough agents online to fill all roles"},
                 status_code=400,
             )
+    unknown_roles = [role for role in cast if role not in roles]
+    if unknown_roles:
+        return JSONResponse(
+            {"error": "cast contains unknown roles: " + ", ".join(map(str, unknown_roles))},
+            status_code=400,
+        )
+    missing_roles = [
+        role for role in roles
+        if not isinstance(cast.get(role), str) or not cast.get(role, "").strip()
+    ]
+    if missing_roles:
+        return JSONResponse(
+            {"error": "cast is missing roles: " + ", ".join(missing_roles)},
+            status_code=400,
+        )
 
-    session = session_engine.start_session(template_id, channel, cast, started_by, goal)
-    if not session:
+    if session_engine.get_active(channel):
+        return JSONResponse(
+            {"error": "could not start session (one may already be active)"},
+            status_code=409,
+        )
+
+    def _create_session():
+        if temporary_template:
+            created = session_store.create_from_template(
+                tmpl=tmpl,
+                channel=channel,
+                cast=cast,
+                started_by=started_by,
+                goal=goal,
+            )
+        else:
+            created = session_store.create(
+                template_id=template_id,
+                channel=channel,
+                cast=cast,
+                started_by=started_by,
+                goal=goal,
+            )
+        return {"session": created} if created is not None else None
+
+    def _rollback_session_state(state):
+        created = state.get("session") if state else None
+        if created is not None:
+            session_store.delete(created["id"])
+
+    try:
+        transaction_result, added, channel_error = _run_channel_state_transaction(
+            channel, _create_session, compensator=_rollback_session_state,
+        )
+    except Exception:
+        log.exception("session creation failed after channel reservation")
+        return JSONResponse({"error": "could not start session"}, status_code=500)
+    if channel_error:
+        status = 409 if "catalogue is full" in channel_error else 400
+        return JSONResponse({"error": channel_error}, status_code=status)
+    if not transaction_result:
         return JSONResponse({"error": "could not start session (one may already be active)"}, status_code=409)
+    session = transaction_result["session"]
+    await _publish_channel_transaction(channel, added)
 
     # Add start banner to chat (only after confirmed success)
-    store.add(
+    _banner, write_error = store_channel_message(
         sender="system",
         text=f"Session started: {tmpl.get('name', template_id)}",
         msg_type="session_start",
         channel=channel,
         metadata={"template_id": template_id, "goal": goal, "session_id": session["id"]},
     )
+    if write_error:
+        return JSONResponse({"error": write_error}, status_code=409)
     session_engine.emit_current_phase_banner(session)
+    session_engine._trigger_current(session)
 
     return JSONResponse(session)
 
@@ -2444,29 +3939,61 @@ async def request_session_draft(request: Request):
     sender = body.get("sender", "user")
     if not agent_name or not description:
         return JSONResponse({"error": "agent and description required"}, status_code=400)
-
     mention_str = f"@{agent_name}"
-    store.add(
-        "system",
-        f"Requested session draft from {mention_str}. Wait for a proposal.",
-        channel=channel,
-    )
-    store.add(
-        sender,
-        f"{mention_str} Design a session workflow for: **{description}**\n\n"
-        "Respond with a single chat message containing a fenced JSON code block with this exact structure:\n"
-        "```session\n"
-        '{"name": "...", "description": "...", "roles": ["role1", "role2", ...], '
-        '"phases": [{"name": "...", "participants": ["role1"], "prompt": "...", "is_output": false}, ...]}\n'
-        "```\n"
-        "Rules: max 6 roles, max 6 phases, max 4 participants per phase, max 200 chars per prompt. "
-        "Mark exactly one phase as `is_output: true` (the final deliverable). "
-        f"Keep it focused and sequential. Use the chat_send tool to post your response in the #{channel} channel. "
-        "Do NOT respond only in your terminal.",
-        channel=channel,
-        msg_type="session_request",
-        metadata={"session_request": True, "mentions": [f"@{agent_name}"], "request": description},
-    )
+
+    def _rollback_draft_request(messages):
+        ids = [message["id"] for message in (messages or []) if message is not None]
+        if ids:
+            store.delete(ids)
+
+    def _create_draft_request():
+        messages = []
+        try:
+            notice, write_error = store_channel_message(
+                "system",
+                f"Requested session draft from {mention_str}. Wait for a proposal.",
+                channel=channel,
+            )
+            if write_error:
+                raise RuntimeError(write_error)
+            messages.append(notice)
+            request_message, write_error = store_channel_message(
+                sender,
+                f"{mention_str} Design a session workflow for: **{description}**\n\n"
+                "Respond with a single chat message containing a fenced JSON code block with this exact structure:\n"
+                "```session\n"
+                '{"name": "...", "description": "...", "roles": ["role1", "role2", ...], '
+                '"phases": [{"name": "...", "participants": ["role1"], "prompt": "...", "is_output": false}, ...]}\n'
+                "```\n"
+                "Rules: max 6 roles, max 6 phases, max 4 participants per phase, max 200 chars per prompt. "
+                "Mark exactly one phase as `is_output: true` (the final deliverable). "
+                f"Keep it focused and sequential. Use the chat_send tool to post your response in the #{channel} channel. "
+                "Do NOT respond only in your terminal.",
+                channel=channel,
+                msg_type="session_request",
+                metadata={"session_request": True, "mentions": [f"@{agent_name}"], "request": description},
+            )
+            if write_error:
+                raise RuntimeError(write_error)
+            messages.append(request_message)
+            return messages
+        except Exception:
+            _rollback_mutation_state(messages, _rollback_draft_request)
+            raise
+
+    try:
+        messages, added, channel_error = _run_channel_state_transaction(
+            channel,
+            _create_draft_request,
+            compensator=_rollback_draft_request,
+        )
+    except Exception:
+        log.exception("session draft request failed after channel reservation")
+        return JSONResponse({"error": "could not create session draft request"}, status_code=500)
+    if channel_error:
+        status = 409 if "catalogue is full" in channel_error else 400
+        return JSONResponse({"error": channel_error}, status_code=status)
+    await _publish_channel_transaction(channel, added)
     return JSONResponse({"ok": True})
 
 
@@ -2476,7 +4003,7 @@ async def save_draft(request: Request):
         return JSONResponse({"error": "sessions not configured"}, status_code=500)
     body = await request.json()
     msg_id = body.get("message_id")
-    if not msg_id:
+    if msg_id is None:
         return JSONResponse({"error": "message_id required"}, status_code=400)
     msg = store.get_by_id(int(msg_id))
     if not msg:
@@ -2484,13 +4011,13 @@ async def save_draft(request: Request):
     meta = msg.get("metadata", {})
     if not meta.get("valid"):
         return JSONResponse({"error": "draft is not valid"}, status_code=400)
-    tmpl = meta.get("template")
+    tmpl = copy.deepcopy(meta.get("template"))
     if not tmpl:
         return JSONResponse({"error": "no template in draft"}, status_code=400)
 
     tmpl.setdefault("id", f"custom-{msg_id}")
-    session_store.save_custom_template(tmpl)
-    return JSONResponse({"ok": True, "template_id": tmpl["id"]})
+    saved = session_store.save_custom_template(tmpl)
+    return JSONResponse({"ok": True, "template_id": saved["id"]})
 
 
 @app.delete("/api/sessions/templates/{template_id}")

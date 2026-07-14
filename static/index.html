@@ -71,9 +71,9 @@
                 </select>
             </div>
             <div class="settings-field">
-                <label for="setting-hops">Loop guard</label>
+                <label for="setting-hops">Loop guard (0 = off)</label>
                 <div class="sched-num-wrap">
-                    <input type="number" id="setting-hops" class="sched-pop-num" min="1" max="50" value="4" title="Max agent-to-agent hops before pausing">
+                    <input type="number" id="setting-hops" class="sched-pop-num" min="0" max="50" value="4" title="Max agent-to-agent hops before pausing; 0 disables the guard">
                     <div class="sched-num-btns">
                         <button type="button" onclick="stepNumInput('setting-hops',1)" tabindex="-1">&#9650;</button>
                         <button type="button" onclick="stepNumInput('setting-hops',-1)" tabindex="-1">&#9660;</button>
@@ -342,8 +342,8 @@
     <script src="/static/store.js?v=223"></script>
     <script src="/static/sessions.js?v=223"></script>
     <script src="/static/jobs.js?v=224"></script>
-    <script src="/static/channels.js?v=224"></script>
+    <script src="/static/channels.js?v=226"></script>
     <script src="/static/rules-panel.js?v=223"></script>
-    <script src="/static/chat.js?v=266"></script>
+    <script src="/static/chat.js?v=269"></script>
 </body>
 </html>

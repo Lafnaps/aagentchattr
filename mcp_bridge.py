@@ -13,6 +13,13 @@ import threading
 from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
+from channel_policy import (
+    CHANNEL_CATALOG_LOCK,
+    DEFAULT_MAX_DISCOVERED_CHANNELS,
+    HARD_MAX_DISCOVERED_CHANNELS,
+    bounded_discovery_limit,
+    channel_name_error,
+)
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +33,8 @@ registry = None       # set by run.py — RuntimeRegistry instance
 config = None         # set by run.py — full config.toml dict
 router = None         # set by run.py — Router instance
 agents = None         # set by run.py — AgentManager instance
+channel_message_writer = None  # set by run.py — app.store_channel_message
+channel_state_mutator = None   # set by run.py — app._run_channel_state_transaction
 _presence: dict[str, float] = {}
 _activity: dict[str, bool] = {}   # True = screen changed on last poll
 _activity_ts: dict[str, float] = {}  # timestamp of last active=True heartbeat
@@ -53,7 +62,8 @@ _CURSORS_FILE: Path | None = None
 
 _MCP_INSTRUCTIONS = (
     "agentchattr — a shared chat channel for coordinating development between AI agents and humans. "
-    "Use chat_send to post messages. Use chat_read to check recent messages. "
+    "Use chat_send to post messages. Use chat_read to check recent messages; "
+    "use chat_read_exact for a durable message_id+channel reference. "
     "Use chat_join when you start a session to announce your presence. "
     "Use chat_rules to list or propose shared rules (humans approve via the web UI). "
     "Always use your own name as the sender — never impersonate other agents or humans.\n\n"
@@ -190,6 +200,70 @@ def _resolve_tool_identity(
     return provided, None
 
 
+def _message_channel_error(channel: object) -> str | None:
+    """Validate MCP channel ingress and fail closed when its catalogue is full."""
+    error = channel_name_error(channel)
+    if error:
+        return error
+    if room_settings is None:
+        return None
+    with CHANNEL_CATALOG_LOCK:
+        channels = room_settings.get("channels", ["general"])
+        limit = bounded_discovery_limit(
+            room_settings.get("max_discovered_channels", DEFAULT_MAX_DISCOVERED_CHANNELS)
+        )
+        if channel not in channels and len(channels) >= limit:
+            return (
+                f"channel catalogue is full ({len(channels)}/{limit}); "
+                "delete an unused channel or raise max_discovered_channels "
+                f"(hard maximum {HARD_MAX_DISCOVERED_CHANNELS})"
+            )
+    return None
+
+
+def _store_channel_message(sender: str, text: str, **kwargs) -> tuple[dict | None, str | None]:
+    """Use the web server's atomic channel admission when available."""
+    channel = kwargs.get("channel", "general")
+    error = _message_channel_error(channel)
+    if error:
+        return None, error
+    if channel_message_writer is not None:
+        return channel_message_writer(sender, text, **kwargs)
+    # Compatibility for isolated bridge tests/embedders. Production run.py
+    # always injects the atomic writer above.
+    return store.add(sender, text, **kwargs), None
+
+
+def _mutate_channel_state(channel: str, mutation, *, compensator=None):
+    """Reserve a channel before MCP structured-state mutation.
+
+    Production injects the web app's transaction primitive.  The fallback is
+    intentionally validation-only for isolated bridge embedders which do not
+    share a persistent web catalogue.
+    """
+    if channel_state_mutator is not None:
+        return channel_state_mutator(
+            channel, mutation, compensator=compensator,
+        )
+    error = _message_channel_error(channel)
+    if error:
+        return None, False, error
+    result = mutation()
+    return result, False, None
+
+
+def _rollback_mutation_state(state, compensator):
+    """Expose partial state to the web transaction if rollback itself fails."""
+    try:
+        compensator(state)
+    except Exception as exc:
+        try:
+            setattr(exc, "_channel_transaction_state", state)
+        except Exception:
+            pass
+        raise
+
+
 def chat_send(
     sender: str,
     message: str,
@@ -234,6 +308,10 @@ def chat_send(
     # Final fallback if still nothing: original 'general' behavior.
     if not channel and not job_id:
         channel = "general"
+    if not job_id:
+        channel_error = _message_channel_error(channel)
+        if channel_error:
+            return f"Error: {channel_error}."
     # Block pending instances (identity not yet confirmed)
     if registry and registry.is_pending(sender):
         return "Error: identity not confirmed. Call chat_claim(sender=your_base_name) to get your identity."
@@ -303,7 +381,11 @@ def chat_send(
                             continue
                     if agents.is_available(target):
                         agents.trigger_sync(target, message=chat_msg,
-                                            channel=job_channel, job_id=job_id)
+                                            channel=job_channel, job_id=job_id,
+                                            action_id=agents.action_id_for(
+                                                "job-message",
+                                                f"{job_id}:{msg['id']}", target,
+                                            ))
 
         return f"Sent to job #{job_id} (msg_id={msg['id']})" + (
             " [suggestion]" if msg_type == "suggestion" else "")
@@ -342,9 +424,17 @@ def chat_send(
         msg_type = "decision"
         metadata = {"choices": clean_choices, "resolved": False}
 
-    msg = store.add(sender, message.strip(), attachments=attachments,
-                    reply_to=reply_id, channel=channel,
-                    msg_type=msg_type, metadata=metadata)
+    msg, channel_error = _store_channel_message(
+        sender,
+        message.strip(),
+        attachments=attachments,
+        reply_to=reply_id,
+        channel=channel,
+        msg_type=msg_type,
+        metadata=metadata,
+    )
+    if channel_error:
+        return f"Error: {channel_error}."
     _update_cursor(sender, [msg], channel)
     with _presence_lock:
         _presence[sender] = time.time()
@@ -375,12 +465,14 @@ def chat_propose_job(
     title = title.strip()[:80]
     body = (body or "").strip()[:1000]
 
-    msg = store.add(
+    msg, channel_error = _store_channel_message(
         sender, f"Job proposal: {title}",
         msg_type="job_proposal",
         channel=channel,
         metadata={"title": title, "body": body, "status": "pending"},
     )
+    if channel_error:
+        return f"Error: {channel_error}."
     _update_cursor(sender, [msg], channel)
     with _presence_lock:
         _presence[sender] = time.time()
@@ -510,6 +602,11 @@ def migrate_identity(old_name: str, new_name: str):
     with _cursors_lock:
         if old_name in _cursors:
             _cursors[new_name] = _cursors.pop(old_name)
+    with _last_read_lock:
+        if old_name in _last_read_channel:
+            _last_read_channel[new_name] = _last_read_channel.pop(old_name)
+        if old_name in _last_read_job_id:
+            _last_read_job_id[new_name] = _last_read_job_id.pop(old_name)
     if old_name in _roles:
         _roles[new_name] = _roles.pop(old_name)
         _save_roles()
@@ -524,6 +621,9 @@ def purge_identity(name: str):
         _activity_ts.pop(name, None)
     with _cursors_lock:
         _cursors.pop(name, None)
+    with _last_read_lock:
+        _last_read_channel.pop(name, None)
+        _last_read_job_id.pop(name, None)
     if name in _roles:
         del _roles[name]
         _save_roles()
@@ -531,19 +631,27 @@ def purge_identity(name: str):
 
 
 def migrate_cursors_rename(old_name: str, new_name: str):
-    """Move cursor entries from old channel name to new channel name."""
+    """Move cursor and fallback entries from old channel to new channel."""
     with _cursors_lock:
         for agent_cursors in _cursors.values():
             if old_name in agent_cursors:
                 agent_cursors[new_name] = agent_cursors.pop(old_name)
+    with _last_read_lock:
+        for sender, channel in list(_last_read_channel.items()):
+            if channel == old_name:
+                _last_read_channel[sender] = new_name
     _save_cursors()
 
 
 def migrate_cursors_delete(channel: str):
-    """Remove cursor entries for a deleted channel."""
+    """Remove cursors and reset every stale fallback to #general."""
     with _cursors_lock:
         for agent_cursors in _cursors.values():
             agent_cursors.pop(channel, None)
+    with _last_read_lock:
+        for sender, fallback in list(_last_read_channel.items()):
+            if fallback == channel:
+                _last_read_channel[sender] = "general"
     _save_cursors()
 
 
@@ -673,6 +781,33 @@ def chat_read(
     return serialized
 
 
+def chat_read_exact(
+    message_id: int,
+    channel: str,
+    sender: str = "",
+    ctx: Context | None = None,
+) -> str:
+    """Read one exact authenticated timeline message without moving a cursor.
+
+    This is the durable-reference counterpart to ``chat_read``.  It does not
+    apply the rolling ``limit`` window, so a stored orchestration reference
+    remains resolvable after arbitrarily many later messages.  Both the ID and
+    channel must match, preventing a stale/mistyped channel reference from
+    silently returning another timeline entry.
+    """
+    sender, err = _resolve_tool_identity(sender, ctx, field_name="sender", required=True)
+    if err:
+        return err
+    if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id < 0:
+        return "Error: message_id must be a non-negative integer."
+    if not isinstance(channel, str) or not channel.strip():
+        return "Error: channel is required."
+    msg = store.get_by_id(message_id) if store else None
+    if msg is None or msg.get("channel", "general") != channel:
+        return f"Error: message #{message_id} was not found in #{channel}."
+    return _serialize_messages([msg])
+
+
 def chat_resync(
     sender: str,
     limit: int = 50,
@@ -798,17 +933,51 @@ def chat_rules(
             return "Error: rule text is required."
         if not sender.strip():
             return "Error: sender is required."
-        result = rules.propose(rule, sender, reason)
-        if result is None:
-            return "Error: too many rules."
-        # Add proposal card to chat timeline
-        if store:
-            store.add(
-                sender, f"Rule proposal: {result['text']}",
-                msg_type="rule_proposal",
-                channel=channel or "general",
-                metadata={"rule_id": result["id"], "text": result["text"], "status": "pending"},
+        channel = channel or "general"
+
+        def _rollback_rule_state(state):
+            if not state:
+                return
+            proposal_message = state.get("message")
+            if proposal_message is not None:
+                store.delete([proposal_message["id"]])
+            proposal = state.get("rule")
+            if proposal is not None:
+                rules.delete(proposal["id"])
+
+        def _propose_rule():
+            state = {"rule": None, "message": None}
+            try:
+                proposal = rules.propose(rule, sender, reason)
+                state["rule"] = proposal
+                if proposal is None:
+                    return None
+                if store:
+                    proposal_message, write_error = _store_channel_message(
+                        sender, f"Rule proposal: {proposal['text']}",
+                        msg_type="rule_proposal",
+                        channel=channel,
+                        metadata={"rule_id": proposal["id"], "text": proposal["text"], "status": "pending"},
+                    )
+                    if write_error:
+                        raise RuntimeError(write_error)
+                    state["message"] = proposal_message
+            except Exception:
+                _rollback_mutation_state(state, _rollback_rule_state)
+                raise
+            return state
+
+        try:
+            state, _added, channel_error = _mutate_channel_state(
+                channel, _propose_rule, compensator=_rollback_rule_state,
             )
+        except Exception as exc:
+            return f"Error: failed to create rule proposal: {exc}."
+        if channel_error:
+            return f"Error: {channel_error}."
+        if state is None:
+            return "Error: too many rules."
+        result = state["rule"]
         return f"Proposed rule #{result['id']}: '{result['text']}'. Human will review in the Rules panel."
 
     if action in ("activate", "edit", "delete"):
@@ -873,7 +1042,8 @@ def chat_claim(sender: str, name: str = "", ctx: Context | None = None) -> str:
 
 def chat_channels() -> str:
     """List all available channels. Returns a JSON array of channel names."""
-    channels = room_settings.get("channels", ["general"]) if room_settings else ["general"]
+    with CHANNEL_CATALOG_LOCK:
+        channels = list(room_settings.get("channels", ["general"])) if room_settings else ["general"]
     return json.dumps(channels)
 
 
@@ -897,6 +1067,9 @@ def chat_summary(
         return err
     action = action.strip().lower()
     channel = (channel or "general").strip()
+    channel_error = _message_channel_error(channel)
+    if channel_error:
+        return f"Error: {channel_error}."
 
     if action == "read":
         entry = summaries.get(channel)
@@ -909,25 +1082,67 @@ def chat_summary(
             return "Error: text is required."
         if len(text.strip()) > 1000:
             return "Error: summary too long (max 1000 characters)."
-        # Get the latest message ID for staleness tracking
-        latest_id = 0
-        if store:
-            recent = store.get_recent(1, channel=channel)
-            if recent:
-                latest_id = recent[-1]["id"]
-        result = summaries.write(channel, text, sender, message_id=latest_id)
-        if result is None:
+
+        def _rollback_summary_state(state):
+            if not state:
+                return
+            summary_message = state.get("message")
+            if summary_message is not None:
+                store.delete([summary_message["id"]])
+            previous = state.get("previous")
+            if previous is None:
+                summaries.delete(channel)
+            else:
+                summaries.write(
+                    channel,
+                    previous["text"],
+                    previous.get("author", ""),
+                    message_id=previous.get("message_id", 0),
+                    uid=previous.get("uid"),
+                    updated_at=previous.get("updated_at"),
+                )
+
+        def _write_summary():
+            previous = summaries.get(channel)
+            latest_id = 0
+            if store:
+                recent = store.get_recent(1, channel=channel)
+                if recent:
+                    latest_id = recent[-1]["id"]
+            result = summaries.write(channel, text, sender, message_id=latest_id)
+            if result is None:
+                return None
+            state = {"summary": result, "previous": previous, "message": None}
+            try:
+                if store:
+                    summary_message, write_error = _store_channel_message(
+                        sender, text.strip(), msg_type="summary", channel=channel
+                    )
+                    if write_error:
+                        raise RuntimeError(write_error)
+                    state["message"] = summary_message
+            except Exception:
+                _rollback_mutation_state(state, _rollback_summary_state)
+                raise
+            return state
+
+        try:
+            state, _added, channel_error = _mutate_channel_state(
+                channel, _write_summary, compensator=_rollback_summary_state,
+            )
+        except Exception as exc:
+            return f"Error: failed to write summary: {exc}."
+        if channel_error:
+            return f"Error: {channel_error}."
+        if state is None:
             return "Error: failed to write summary."
-        # Post a visual summary message to the timeline
-        if store:
-            store.add(sender, text.strip(), msg_type="summary", channel=channel)
         return f"Summary for #{channel} updated ({len(text.strip())} chars)."
 
     return f"Unknown action: {action}. Valid actions: read, write."
 
 
 _ALL_TOOLS = [
-    chat_send, chat_read, chat_resync, chat_join, chat_who, chat_rules, chat_decision,
+    chat_send, chat_read, chat_read_exact, chat_resync, chat_join, chat_who, chat_rules, chat_decision,
     chat_channels, chat_set_hat, chat_claim, chat_summary, chat_propose_job,
 ]
 

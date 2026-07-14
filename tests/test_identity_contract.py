@@ -122,6 +122,43 @@ class McpBridgeAuthTests(unittest.TestCase):
 
         self.assertIn("stale or unknown authenticated agent session", result)
 
+    def test_chat_read_exact_survives_more_than_twenty_later_messages(self):
+        inst = self.registry.register("codex")
+        target = self.store.add("user", "durable target", channel="lane-work")
+        for index in range(25):
+            self.store.add("claude-work", f"later {index}", channel="lane-work")
+
+        rolling = mcp_bridge.chat_read(
+            sender="", since_id=target["id"] - 1, limit=20, channel="lane-work",
+            ctx=auth_ctx(inst["token"]),
+        )
+        cursor_before_exact = dict(mcp_bridge._cursors.get(inst["name"], {}))
+        exact = mcp_bridge.chat_read_exact(
+            message_id=target["id"], channel="lane-work", sender="",
+            ctx=auth_ctx(inst["token"]),
+        )
+
+        self.assertNotIn("durable target", rolling)
+        payload = json.loads(exact)
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0]["id"], target["id"])
+        self.assertEqual(payload[0]["text"], "durable target")
+        self.assertEqual(
+            mcp_bridge._cursors.get(inst["name"], {}), cursor_before_exact
+        )
+
+    def test_chat_read_exact_requires_auth_and_matching_channel(self):
+        inst = self.registry.register("codex")
+        target = self.store.add("user", "target", channel="lane-work")
+        unauthenticated = mcp_bridge.chat_read_exact(
+            message_id=target["id"], channel="lane-work", sender="codex")
+        wrong_channel = mcp_bridge.chat_read_exact(
+            message_id=target["id"], channel="general", sender="",
+            ctx=auth_ctx(inst["token"]),
+        )
+        self.assertIn("authenticated agent session required", unauthenticated)
+        self.assertIn("was not found", wrong_channel)
+
 
 class AppAuthEndpointTests(unittest.TestCase):
     def setUp(self):

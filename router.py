@@ -8,11 +8,28 @@ class Router:
                  max_hops: int = 4, online_checker=None):
         self.agent_names = set(n.lower() for n in agent_names)
         self.default_mention = default_mention
-        self.max_hops = max_hops
         self._online_checker = online_checker  # callable() -> set of online agent names
         # Per-channel state: { channel: { hop_count, paused, guard_emitted } }
         self._channels: dict[str, dict] = {}
+        self.max_hops = max_hops
         self._build_pattern()
+
+    @property
+    def max_hops(self) -> int:
+        """Maximum agent-to-agent hops; zero disables the loop guard."""
+        return self._max_hops
+
+    @max_hops.setter
+    def max_hops(self, value: int):
+        self._max_hops = max(0, int(value))
+        if self._max_hops == 0:
+            # Disabling the guard must also release channels paused under the
+            # previous setting. Otherwise "0 = off" would still need a human
+            # /continue before it took effect.
+            for ch in self._channels.values():
+                ch["hop_count"] = 0
+                ch["paused"] = False
+                ch["guard_emitted"] = False
 
     def _get_ch(self, channel: str) -> dict:
         if channel not in self._channels:
@@ -68,15 +85,16 @@ class Router:
             return mentions
         else:
             # Agent message: blocked while loop guard is active
-            if ch["paused"]:
+            if self.max_hops > 0 and ch["paused"]:
                 return []
             # Only route if explicit @mention
             if not mentions:
                 return []
-            ch["hop_count"] += 1
-            if ch["hop_count"] > self.max_hops:
-                ch["paused"] = True
-                return []
+            if self.max_hops > 0:
+                ch["hop_count"] += 1
+                if ch["hop_count"] > self.max_hops:
+                    ch["paused"] = True
+                    return []
             # Don't route back to self
             return [m for m in mentions if m != sender]
 

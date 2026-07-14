@@ -54,7 +54,7 @@ class SessionEngine:
 
     def emit_current_phase_banner(self, session: dict):
         """Post the banner for the session's current phase."""
-        tmpl = self._store.get_template(session.get("template_id", ""))
+        tmpl = self._store.get_template_for_session(session)
         if not tmpl:
             return
 
@@ -174,7 +174,7 @@ class SessionEngine:
 
     def _advance(self, session: dict, message_id: int):
         """Advance session after the expected agent has responded."""
-        tmpl = self._store.get_template(session["template_id"])
+        tmpl = self._store.get_template_for_session(session)
         if not tmpl:
             self._store.interrupt(session["id"], "template not found")
             return
@@ -222,7 +222,7 @@ class SessionEngine:
 
     def _trigger_current(self, session: dict):
         """Trigger the agent whose turn it is."""
-        tmpl = self._store.get_template(session["template_id"])
+        tmpl = self._store.get_template_for_session(session)
         if not tmpl:
             return
 
@@ -265,7 +265,17 @@ class SessionEngine:
                  session["id"], agent, role, phase["name"])
 
         try:
-            self._trigger.trigger_sync(agent, channel=channel, prompt=prompt)
+            self._trigger.trigger_sync(
+                agent, channel=channel, prompt=prompt,
+                action_id=self._trigger.action_id_for(
+                    "session-phase",
+                    (
+                        f"{session['id']}:{session['current_phase']}:"
+                        f"{session['current_turn']}:{role}"
+                    ),
+                    agent,
+                ),
+            )
         except Exception as exc:
             log.error("Session %d: failed to trigger %s: %s",
                       session["id"], agent, exc)
@@ -303,7 +313,7 @@ class SessionEngine:
 
     def _get_expected_agent(self, session: dict) -> str | None:
         """Get the agent name expected to respond next."""
-        tmpl = self._store.get_template(session["template_id"])
+        tmpl = self._store.get_template_for_session(session)
         if not tmpl:
             return None
 
@@ -326,7 +336,7 @@ class SessionEngine:
 
     def _enrich(self, session: dict) -> dict:
         """Add computed fields to a session dict for the frontend."""
-        tmpl = self._store.get_template(session["template_id"])
+        tmpl = self._store.get_template_for_session(session)
         if tmpl:
             phases = tmpl.get("phases", [])
             session["total_phases"] = len(phases)

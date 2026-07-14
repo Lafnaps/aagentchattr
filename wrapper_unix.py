@@ -39,20 +39,38 @@ def _check_tmux():
     sys.exit(1)
 
 
-def inject(text: str, *, tmux_session: str, delay: float = 0.3):
-    """Send text + Enter to a tmux session via send-keys."""
+def inject(text: str, *, tmux_session: str, delay: float = 0.3,
+           command_timeout: float = 5.0):
+    """Send text + Enter to a tmux session with bounded/fail-closed results.
+
+    ``deferred`` means tmux positively rejected the text command and replay is
+    safe.  Once text may have reached the composer, any timeout/Enter failure
+    is ``injected-uncertain``: the durable watcher blocks for manual recovery
+    instead of appending/possibly submitting a duplicate prompt.
+    """
     # Use -l to send text literally (avoids misinterpreting as key names),
     # then send Enter as a separate key press
-    subprocess.run(
-        ["tmux", "send-keys", "-t", tmux_session, "-l", text],
-        capture_output=True,
-    )
+    try:
+        text_result = subprocess.run(
+            ["tmux", "send-keys", "-t", tmux_session, "-l", text],
+            capture_output=True, timeout=command_timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return "injected-uncertain"
+    if text_result.returncode != 0:
+        return "deferred"
     # Scale delay with text length so longer prompts get more processing time
     time.sleep(max(delay, len(text) * 0.001))
-    subprocess.run(
-        ["tmux", "send-keys", "-t", tmux_session, "Enter"],
-        capture_output=True,
-    )
+    try:
+        enter_result = subprocess.run(
+            ["tmux", "send-keys", "-t", tmux_session, "Enter"],
+            capture_output=True, timeout=command_timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return "injected-uncertain"
+    if enter_result.returncode != 0:
+        return "injected-uncertain"
+    return "injected"
 
 
 def get_activity_checker(session_name, trigger_flag=None):

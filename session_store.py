@@ -1,6 +1,9 @@
 """Session store — persists active session runs to JSON."""
 
+import copy
 import json
+import os
+import tempfile
 import time
 import threading
 import logging
@@ -9,13 +12,48 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
+def _atomic_write_text(path: Path, content: str):
+    """Replace *path* atomically after flushing file contents."""
+    fd = None
+    temp_path: Path | None = None
+    try:
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+        )
+        temp_path = Path(temp_name)
+        stream = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        fd = None
+        with stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
 class SessionStore:
     def __init__(self, path: str, templates_dir: str | None = None):
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._sessions: list[dict] = []
         self._next_id = 1
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._callbacks: list = []
         self._templates: dict[str, dict] = {}
         self._load()
@@ -57,9 +95,9 @@ class SessionStore:
             self._sessions = []
 
     def _save(self):
-        self._path.write_text(
+        _atomic_write_text(
+            self._path,
             json.dumps(self._sessions, indent=2, ensure_ascii=False) + "\n",
-            "utf-8",
         )
 
     # --- Templates ---
@@ -80,53 +118,74 @@ class SessionStore:
                 log.warning("Failed to load template %s: %s", f.name, exc)
 
     def get_templates(self) -> list[dict]:
-        return list(self._templates.values())
+        with self._lock:
+            return copy.deepcopy(list(self._templates.values()))
 
     def get_template(self, template_id: str) -> dict | None:
-        return self._templates.get(template_id)
+        with self._lock:
+            tmpl = self._templates.get(template_id)
+            return copy.deepcopy(tmpl) if tmpl is not None else None
+
+    def get_template_for_session(self, session: dict | int) -> dict | None:
+        """Resolve a session's inline template before the global catalogue."""
+        with self._lock:
+            if isinstance(session, int):
+                session_data = self._find(session)
+            elif isinstance(session, dict):
+                session_data = session
+            else:
+                session_data = None
+            if not session_data:
+                return None
+            transient = session_data.get("transient_template")
+            if isinstance(transient, dict):
+                return copy.deepcopy(transient)
+            template_id = session_data.get("template_id")
+            tmpl = self._templates.get(template_id)
+            return copy.deepcopy(tmpl) if tmpl is not None else None
 
     def save_custom_template(self, tmpl: dict) -> dict:
         custom_path = self._path.parent / "custom_templates.json"
-        custom = []
-        if custom_path.exists():
-            try:
-                custom = json.loads(custom_path.read_text("utf-8"))
-            except (json.JSONDecodeError, KeyError):
-                custom = []
-
-        saved = dict(tmpl)
+        saved = copy.deepcopy(tmpl)
+        template_id = saved.get("id")
+        if not isinstance(template_id, str) or not template_id:
+            raise ValueError("custom template id is required")
         saved["is_custom"] = True
-        custom = [t for t in custom if t.get("id") != saved.get("id")]
-        custom.append(saved)
-        custom_path.write_text(json.dumps(custom, indent=2, ensure_ascii=False) + "\n", "utf-8")
-        self._templates[saved["id"]] = saved
-        return saved
+        with self._lock:
+            custom = [
+                copy.deepcopy(item) for item in self._templates.values()
+                if item.get("is_custom") and item.get("id") != template_id
+            ]
+            custom.append(saved)
+            _atomic_write_text(
+                custom_path,
+                json.dumps(custom, indent=2, ensure_ascii=False) + "\n",
+            )
+            self._templates[template_id] = copy.deepcopy(saved)
+        return copy.deepcopy(saved)
 
     def delete_custom_template(self, template_id: str) -> bool:
-        tmpl = self._templates.get(template_id)
-        if not tmpl or not tmpl.get("is_custom"):
-            return False
-
         custom_path = self._path.parent / "custom_templates.json"
-        custom = []
-        if custom_path.exists():
-            try:
-                custom = json.loads(custom_path.read_text("utf-8"))
-            except (json.JSONDecodeError, KeyError):
-                custom = []
-
-        new_custom = [t for t in custom if t.get("id") != template_id]
-        if len(new_custom) != len(custom):
-            custom_path.write_text(json.dumps(new_custom, indent=2, ensure_ascii=False) + "\n", "utf-8")
-
-        self._templates.pop(template_id, None)
+        with self._lock:
+            tmpl = self._templates.get(template_id)
+            if not tmpl or not tmpl.get("is_custom"):
+                return False
+            new_custom = [
+                copy.deepcopy(item) for item in self._templates.values()
+                if item.get("is_custom") and item.get("id") != template_id
+            ]
+            _atomic_write_text(
+                custom_path,
+                json.dumps(new_custom, indent=2, ensure_ascii=False) + "\n",
+            )
+            self._templates.pop(template_id, None)
         return True
 
     # --- Callbacks ---
 
     def on_change(self, callback):
         """Register a callback(action, session) on any change.
-        action: 'create', 'update', 'complete', 'interrupt'."""
+        action: 'create', 'update', 'complete', 'interrupt', 'delete'."""
         self._callbacks.append(callback)
 
     def _fire(self, action: str, session: dict):
@@ -141,10 +200,30 @@ class SessionStore:
     def create(self, template_id: str, channel: str, cast: dict,
                started_by: str, goal: str = "") -> dict | None:
         """Create and persist a new session run."""
-        tmpl = self._templates.get(template_id)
+        with self._lock:
+            tmpl = copy.deepcopy(self._templates.get(template_id))
         if not tmpl:
             return None
+        return self._create_with_template(
+            template_id, tmpl, channel, cast, started_by, goal,
+            transient=False,
+        )
 
+    def create_from_template(self, tmpl: dict, channel: str, cast: dict,
+                             started_by: str, goal: str = "") -> dict | None:
+        """Create from an inline template without publishing it as custom."""
+        template = copy.deepcopy(tmpl)
+        template_id = template.get("id")
+        if not isinstance(template_id, str) or not template_id:
+            raise ValueError("inline template id is required")
+        return self._create_with_template(
+            template_id, template, channel, cast, started_by, goal,
+            transient=True,
+        )
+
+    def _create_with_template(self, template_id: str, tmpl: dict,
+                              channel: str, cast: dict, started_by: str,
+                              goal: str, *, transient: bool) -> dict | None:
         with self._lock:
             # One active session per channel
             for s in self._sessions:
@@ -156,7 +235,7 @@ class SessionStore:
                 "template_id": template_id,
                 "template_name": tmpl.get("name", template_id),
                 "channel": channel,
-                "cast": cast,
+                "cast": copy.deepcopy(cast),
                 "state": "active",
                 "current_phase": 0,
                 "current_turn": 0,
@@ -167,18 +246,45 @@ class SessionStore:
                 "output_message_id": None,
                 "goal": goal.strip()[:500],
             }
+            if transient:
+                session["transient_template"] = copy.deepcopy(tmpl)
+            previous_next_id = self._next_id
             self._next_id += 1
             self._sessions.append(session)
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                self._sessions.pop()
+                self._next_id = previous_next_id
+                raise
 
-        self._fire("create", session)
-        return session
+        result = copy.deepcopy(session)
+        self._fire("create", result)
+        return result
+
+    def delete(self, session_id: int) -> dict | None:
+        """Delete a session, restoring it if persistence fails."""
+        with self._lock:
+            for index, session in enumerate(self._sessions):
+                if session["id"] == session_id:
+                    removed = self._sessions.pop(index)
+                    try:
+                        self._save()
+                    except Exception:
+                        self._sessions.insert(index, removed)
+                        raise
+                    result = copy.deepcopy(removed)
+                    break
+            else:
+                return None
+        self._fire("delete", result)
+        return result
 
     def get(self, session_id: int) -> dict | None:
         with self._lock:
             for s in self._sessions:
                 if s["id"] == session_id:
-                    return dict(s)
+                    return copy.deepcopy(s)
             return None
 
     def get_active(self, channel: str) -> dict | None:
@@ -186,12 +292,12 @@ class SessionStore:
         with self._lock:
             for s in self._sessions:
                 if s.get("channel") == channel and s.get("state") in ("active", "waiting", "paused"):
-                    return dict(s)
+                    return copy.deepcopy(s)
             return None
 
     def list_all(self, channel: str | None = None) -> list[dict]:
         with self._lock:
-            result = list(self._sessions)
+            result = copy.deepcopy(self._sessions)
         if channel:
             result = [s for s in result if s.get("channel") == channel]
         return result
@@ -202,13 +308,19 @@ class SessionStore:
             session = self._find(session_id)
             if not session or session["state"] not in ("active", "waiting"):
                 return None
+            previous = copy.deepcopy(session)
             session["current_turn"] += 1
             session["state"] = "active"
             session["updated_at"] = time.time()
             if message_id is not None:
                 session["last_message_id"] = message_id
-            self._save()
-            result = dict(session)
+            try:
+                self._save()
+            except Exception:
+                session.clear()
+                session.update(previous)
+                raise
+            result = copy.deepcopy(session)
         self._fire("update", result)
         return result
 
@@ -218,14 +330,20 @@ class SessionStore:
             session = self._find(session_id)
             if not session or session["state"] not in ("active", "waiting"):
                 return None
+            previous = copy.deepcopy(session)
             session["current_phase"] += 1
             session["current_turn"] = 0
             session["state"] = "active"
             session["updated_at"] = time.time()
             if message_id is not None:
                 session["last_message_id"] = message_id
-            self._save()
-            result = dict(session)
+            try:
+                self._save()
+            except Exception:
+                session.clear()
+                session.update(previous)
+                raise
+            result = copy.deepcopy(session)
         self._fire("update", result)
         return result
 
@@ -235,11 +353,17 @@ class SessionStore:
             session = self._find(session_id)
             if not session:
                 return None
+            previous = copy.deepcopy(session)
             session["state"] = "waiting"
             session["waiting_on"] = agent
             session["updated_at"] = time.time()
-            self._save()
-            result = dict(session)
+            try:
+                self._save()
+            except Exception:
+                session.clear()
+                session.update(previous)
+                raise
+            result = copy.deepcopy(session)
         self._fire("update", result)
         return result
 
@@ -249,10 +373,16 @@ class SessionStore:
             session = self._find(session_id)
             if not session or session["state"] not in ("active", "waiting"):
                 return None
+            previous = copy.deepcopy(session)
             session["state"] = "paused"
             session["updated_at"] = time.time()
-            self._save()
-            result = dict(session)
+            try:
+                self._save()
+            except Exception:
+                session.clear()
+                session.update(previous)
+                raise
+            result = copy.deepcopy(session)
         self._fire("update", result)
         return result
 
@@ -262,10 +392,16 @@ class SessionStore:
             session = self._find(session_id)
             if not session or session["state"] != "paused":
                 return None
+            previous = copy.deepcopy(session)
             session["state"] = "active"
             session["updated_at"] = time.time()
-            self._save()
-            result = dict(session)
+            try:
+                self._save()
+            except Exception:
+                session.clear()
+                session.update(previous)
+                raise
+            result = copy.deepcopy(session)
         self._fire("update", result)
         return result
 
@@ -275,12 +411,18 @@ class SessionStore:
             session = self._find(session_id)
             if not session:
                 return None
+            previous = copy.deepcopy(session)
             session["state"] = "complete"
             session["updated_at"] = time.time()
             if output_message_id is not None:
                 session["output_message_id"] = output_message_id
-            self._save()
-            result = dict(session)
+            try:
+                self._save()
+            except Exception:
+                session.clear()
+                session.update(previous)
+                raise
+            result = copy.deepcopy(session)
         self._fire("complete", result)
         return result
 
@@ -290,11 +432,17 @@ class SessionStore:
             session = self._find(session_id)
             if not session or session["state"] in ("complete", "interrupted"):
                 return None
+            previous = copy.deepcopy(session)
             session["state"] = "interrupted"
             session["interrupt_reason"] = reason
             session["updated_at"] = time.time()
-            self._save()
-            result = dict(session)
+            try:
+                self._save()
+            except Exception:
+                session.clear()
+                session.update(previous)
+                raise
+            result = copy.deepcopy(session)
         self._fire("interrupt", result)
         return result
 

@@ -22,6 +22,8 @@ let lastMessageDates = {};  // { channel: dateString } for per-channel dividers
 let soundEnabled = false;  // suppress sounds during initial history load
 let activeChannel = localStorage.getItem('agentchattr-channel') || 'general';
 let channelList = ['general'];
+let maxChannels = 64;
+let catalogueRevision = 0;
 let channelUnread = {};  // { channelName: count }
 let agentHats = {};  // { agent_name: svg_string }
 window.customRoles = [];  // saved custom roles from settings
@@ -33,6 +35,8 @@ let schedulesList = [];  // array of schedule objects from server
 Object.defineProperty(window, 'SESSION_TOKEN', { get() { return SESSION_TOKEN; } });
 Object.defineProperty(window, 'activeChannel', { get() { return activeChannel; } });
 Object.defineProperty(window, 'channelList', { get() { return channelList; }, set(v) { channelList = v; } });
+Object.defineProperty(window, 'maxChannels', { get() { return maxChannels; }, set(v) { maxChannels = v; } });
+Object.defineProperty(window, 'catalogueRevision', { get() { return catalogueRevision; } });
 Object.defineProperty(window, 'channelUnread', { get() { return channelUnread; }, set(v) { channelUnread = v; } });
 window._setActiveChannel = function(v) { activeChannel = v; };
 window._setPendingChannelSwitch = function(v) { pendingChannelSwitch = v; };
@@ -382,9 +386,28 @@ function connectWebSocket() {
 
     ws.onmessage = (e) => {
         const event = JSON.parse(e.data);
+        const catalogueFrame = event.type === 'settings' || event.type === 'message' || event.type === 'channel_renamed';
+        if (catalogueFrame) {
+            const revision = _frameCatalogueRevision(event);
+            if (revision < catalogueRevision) return;
+            catalogueRevision = revision;
+        }
         // Emit through Hub for modules to subscribe (PR 1 seam)
         Hub.emit(event.type, event);
-        if (event.type === 'message_update') {
+        if (event.type === 'error') {
+            showToast(event.error || 'Request rejected by server', 'error');
+            if (event.code === 'channel_rejected') {
+                pendingChannelSwitch = null;
+                const revision = _frameCatalogueRevision(event);
+                if (event.settings && revision >= catalogueRevision) {
+                    catalogueRevision = revision;
+                    applySettings(event.settings);
+                }
+                if (event.restore_channel && channelList.includes(event.restore_channel)) {
+                    switchChannel(event.restore_channel);
+                }
+            }
+        } else if (event.type === 'message_update') {
             // Re-render an updated message in-place (e.g. decision card resolved)
             const updated = event.message;
             if (updated && updated.id) {
@@ -399,6 +422,15 @@ function connectWebSocket() {
                 }
             }
         } else if (event.type === 'message') {
+            const revision = _frameCatalogueRevision(event);
+            if (revision < catalogueRevision) return;
+            catalogueRevision = revision;
+            // The server normally broadcasts settings first. Keep this path
+            // defensive so a delayed/lost settings frame cannot leave a live
+            // message channel invisible until the next reload.
+            if (window.ensureChannelDiscovered) {
+                window.ensureChannelDiscovered(event.data.channel || 'general', revision);
+            }
             // Play notification sound for new messages from others (not joins, not when focused)
             if (soundEnabled && !document.hasFocus() && event.data.type !== 'join' && event.data.type !== 'leave' && event.data.type !== 'summary' && event.data.sender && event.data.sender.toLowerCase() !== username.toLowerCase()) {
                 playNotificationSound(event.data.sender);
@@ -500,6 +532,9 @@ function connectWebSocket() {
         } else if (event.type === 'typing') {
             updateTyping(event.agent, event.active);
         } else if (event.type === 'settings') {
+            const revision = _frameCatalogueRevision(event);
+            if (revision < catalogueRevision) return;
+            catalogueRevision = revision;
             applySettings(event.data);
         } else if (event.type === 'delete') {
             handleDeleteBroadcast(event.ids);
@@ -527,6 +562,29 @@ function connectWebSocket() {
             });
             _showNextPendingName();
         } else if (event.type === 'channel_renamed') {
+            const revision = _frameCatalogueRevision(event);
+            if (revision < catalogueRevision) return;
+            catalogueRevision = revision;
+            // Apply the rename frame as a complete local migration. The
+            // authoritative settings frame with the same revision follows,
+            // but this keeps the UI correct even if a socket closes between
+            // the two sends.
+            const channelIndex = channelList.indexOf(event.old_name);
+            if (channelIndex !== -1) {
+                channelList = [...channelList];
+                channelList[channelIndex] = event.new_name;
+            }
+            if (channelUnread[event.old_name] !== undefined) {
+                channelUnread[event.new_name] = channelUnread[event.old_name];
+                delete channelUnread[event.old_name];
+            }
+            if (_channelMentions[event.old_name] !== undefined) {
+                _channelMentions[event.new_name] = _channelMentions[event.old_name];
+                delete _channelMentions[event.old_name];
+            }
+            if (pendingChannelSwitch === event.old_name) {
+                pendingChannelSwitch = event.new_name;
+            }
             // Migrate data-channel on existing DOM elements
             const container = document.getElementById('messages');
             for (const el of container.children) {
@@ -545,6 +603,8 @@ function connectWebSocket() {
                 localStorage.setItem('agentchattr-channel', event.new_name);
                 Store.set('activeChannel', event.new_name);
             }
+            filterMessagesByChannel();
+            renderChannelTabs();
         } else if (event.type === 'edit') {
             // A message was edited/demoted — re-render it in place
             const updatedMsg = event.message;
@@ -1736,6 +1796,12 @@ function updateTyping(agent, active) {
 
 let pendingChannelSwitch = null;
 
+function _frameCatalogueRevision(event) {
+    const raw = event.catalogue_revision ?? event.data?.catalogue_revision ?? 0;
+    const parsed = Number.parseInt(raw, 10);
+    return Number.isNaN(parsed) ? 0 : Math.max(0, parsed);
+}
+
 function applySettings(data) {
     if (data.title) {
         document.getElementById('room-title').textContent = data.title;
@@ -1766,6 +1832,10 @@ function applySettings(data) {
     }
     if (Array.isArray(data.custom_roles)) {
         window.customRoles = data.custom_roles;
+    }
+    if (data.max_channels !== undefined) {
+        const parsedMaxChannels = parseInt(data.max_channels, 10);
+        maxChannels = Number.isNaN(parsedMaxChannels) ? 64 : Math.max(1, parsedMaxChannels);
     }
     if (data.channels && Array.isArray(data.channels)) {
         channelList = data.channels;
@@ -1866,6 +1936,7 @@ function saveSettings() {
     const newUsername = document.getElementById('setting-username').value.trim();
     const newFont = document.getElementById('setting-font').value;
     const newHops = document.getElementById('setting-hops').value;
+    const parsedHops = parseInt(newHops, 10);
     const histVal = document.getElementById('setting-history').value;
     const newHistory = histVal === 'all' ? 'all' : (parseInt(histVal) || 50);
     const newContrast = document.getElementById('setting-contrast').value;
@@ -1877,7 +1948,7 @@ function saveSettings() {
             data: {
                 username: newUsername || 'user',
                 font: newFont,
-                max_agent_hops: parseInt(newHops) || 4,
+                max_agent_hops: Number.isNaN(parsedHops) ? 4 : parsedHops,
                 history_limit: newHistory,
                 contrast: newContrast,
                 rules_refresh_interval: parseInt(newRulesRefresh) || 0,
@@ -1901,6 +1972,10 @@ function setupSettingsKeys() {
             }
         });
     }
+
+    // The custom number arrows dispatch "change" after updating the value.
+    // Persist that new value even though focus moved to the arrow button.
+    document.getElementById('setting-hops').addEventListener('change', saveSettings);
 
     // Auto-save on change for selects, escape to close
     for (const id of ['setting-font', 'setting-history', 'setting-contrast', 'setting-rules-refresh']) {
@@ -3434,9 +3509,13 @@ function closeSchedulePopover() {
 function stepNumInput(id, delta) {
     const el = document.getElementById(id);
     if (!el) return;
-    const min = parseInt(el.min) || 1;
-    const max = parseInt(el.max) || 99;
-    const val = Math.max(min, Math.min(max, (parseInt(el.value) || min) + delta));
+    const parsedMin = parseInt(el.min, 10);
+    const parsedMax = parseInt(el.max, 10);
+    const parsedValue = parseInt(el.value, 10);
+    const min = Number.isNaN(parsedMin) ? 1 : parsedMin;
+    const max = Number.isNaN(parsedMax) ? 99 : parsedMax;
+    const current = Number.isNaN(parsedValue) ? min : parsedValue;
+    const val = Math.max(min, Math.min(max, current + delta));
     el.value = val;
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));

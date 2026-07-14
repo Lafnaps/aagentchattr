@@ -515,7 +515,7 @@ temperature = 1.0
 
 [routing]
 default = "none"            # "none" = only @mentions trigger agents
-max_agent_hops = 4          # pause after N agent-to-agent messages
+max_agent_hops = 4          # pause after N agent-to-agent messages; 0 disables the guard
 
 [mcp]
 http_port = 8200            # MCP streamable-http (Claude Code, Codex)

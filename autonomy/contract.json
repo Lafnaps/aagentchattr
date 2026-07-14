@@ -1,0 +1,226 @@
+{
+  "version": 1,
+  "name": "agentchattr-autonomy-queue",
+  "root_marker": {
+    "file": "autonomy-root.json",
+    "closed_schema": true,
+    "keys": {
+      "version": {"type": "int", "const": 1},
+      "name": {"type": "string", "const": "agentchattr-autonomy-queue"}
+    },
+    "note": "every command refuses roots whose marker is missing, unreadable, non-regular, has extra/missing keys, or non-exact types"
+  },
+  "cli": {
+    "invocation": "python -m autonomy.queue_cli --root ROOT <command> ...",
+    "stdout": "exactly one JSON object per invocation, success and failure alike; nothing else is printed",
+    "exit_codes": {
+      "0": "success",
+      "2": "validation error or transition conflict (fail-closed refusal); includes claim finding no eligible work",
+      "3": "AUDIT_GAP reported by audit, or unrecoverable I/O failure"
+    },
+    "claim_no_eligible_work": {
+      "exit": 2,
+      "json": {"ok": false, "error": "nothing-to-claim", "claimed": null},
+      "note": "an empty poll is deliberately a non-success exit so schedulers cannot mistake it for a claim"
+    },
+    "commands": {
+      "init": "--root R init",
+      "enqueue": "--root R enqueue --card ABSOLUTE_PATH",
+      "claim": "--root R claim --profile P --model M --worker W",
+      "peek-exact": "--root R peek-exact --task-id T",
+      "list-exact": "--root R list-exact",
+      "claim-exact": "--root R claim-exact --task-id T --expected-next-attempt N --expected-digest D --profile P --model M --worker W",
+      "quarantine-exact-payload": "--root R quarantine-exact-payload --task-id T --worker W",
+      "complete": "--root R complete --task-id T --worker W",
+      "complete-exact": "--root R complete-exact --task-id T --expected-attempt N --expected-digest D --worker W",
+      "fail": "--root R fail --task-id T --worker W [--reason TEXT]",
+      "fail-exact": "--root R fail-exact --task-id T --expected-attempt N --expected-digest D --worker W --disposition retry|final [--reason TEXT]",
+      "block": "--root R block --task-id T --worker W --reason TEXT",
+      "block-exact": "--root R block-exact --task-id T --expected-attempt N --expected-digest D --worker W --reason TEXT",
+      "requeue": "--root R requeue --task-id T --worker W",
+      "requeue-exact": "--root R requeue-exact --task-id T --expected-attempt N --expected-digest D --worker W",
+      "audit": "--root R audit"
+    }
+  },
+  "states": ["queue", "in_progress", "done", "failed", "blocked"],
+  "invariant": "exactly one of the five state directories contains <task_id>.json for every known task; audit reports duplicate or missing state as AUDIT_GAP",
+  "durable_layout": {
+    "exact_protocol": "exact/<task_id>.json is an immutable per-task protocol marker published before the first exact state mutation; its prior_event_seq binds the marker-free legacy prefix and exact protocol governs the contiguous tail",
+    "events": "events/<task_id>/<seq:06d>.json is the append-only transition chain",
+    "attempts": "attempts/<task_id>/a<N>/ is the immutable claim-attempt index"
+  },
+  "transitions": {
+    "claim": {"from": "queue", "to": "in_progress", "actor": "worker; a queued card with attempt >= max_attempts is refused without durable mutation: legacy claim refuses max-attempts-exhausted, while exact verbs refuse it during semantic validation as exact-evidence-invalid (audit reports attempt_budget_violation)", "attempt_semantics": "event.attempt = incremented attempt; the increment may never exceed max_attempts"},
+    "complete": {"from": "in_progress", "to": "done", "actor": "worker", "attempt_semantics": "unchanged"},
+    "fail-retry": {"from": "in_progress", "to": "queue", "actor": "supervisor via CLI fail; chosen when attempt < max_attempts", "attempt_semantics": "unchanged"},
+    "fail-final": {"from": "in_progress", "to": "failed", "actor": "supervisor via CLI fail; chosen when attempt >= max_attempts", "attempt_semantics": "unchanged"},
+    "block": {"from": "in_progress", "to": "blocked", "actor": "worker; --reason required", "attempt_semantics": "unchanged"},
+    "block-malformed": {"from": "queue", "to": "blocked", "actor": "claim quarantine of an unreadable/invalid card; event.attempt recorded as 0 because the card cannot be read and is not replay-checked", "attempt_semantics": "unchecked"},
+    "block-payload": {"from": "queue", "to": "blocked", "actor": "claim quarantine when payload containment/sha256 verification fails", "attempt_semantics": "unchanged"},
+    "block-attempt-dir": {"from": "queue", "to": "blocked", "actor": "claim quarantine when attempts/<task>/a<N> already exists or its path is unsafe", "attempt_semantics": "unchanged"},
+    "requeue-blocked": {"from": "blocked", "to": "queue", "actor": "operator; marker-free tasks only; only while attempt < max_attempts; preserves attempt", "attempt_semantics": "unchanged"},
+    "requeue-failed": {"from": "failed", "to": "queue", "actor": "operator; marker-free tasks only; only while attempt < max_attempts; preserves attempt", "attempt_semantics": "unchanged"},
+    "requeue-exact": {"from": "blocked", "to": "queue", "actor": "operator/worker owning the exact blocked tail via CLI requeue-exact; only while attempt < max_attempts and the payload re-verifies byte-exactly; preserves attempt. The tail must be a terminal block or an exact block-payload quarantine: a block-attempt-dir tail refuses exact-attempt-dir-not-requeueable for every worker because its immutable collision directory cannot be removed or reused (recovery is a new task_id)", "attempt_semantics": "unchanged; the exact event binds attempt_dir a<attempt+1>, the re-armed next generation that the subsequent exact claim creates"}
+  },
+  "task_card": {
+    "closed_schema": true,
+    "duplicate_json_keys": "rejected",
+    "max_file_bytes": 1048576,
+    "keys": {
+      "version": {"type": "int", "const": 1, "note": "bool rejected"},
+      "task_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$", "note": "Windows reserved device names (con, prn, aux, nul, com1-9, lpt1-9) additionally rejected"},
+      "profile": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
+      "model": {"type": "string", "pattern": "^[a-z0-9][a-z0-9.-]{0,63}$"},
+      "allowed_root": {"type": "string", "constraint": "absolute path, <=1024 chars, no NUL; claimant refuses payloads outside it"},
+      "restart_safe": {"type": "bool", "default": false, "note": "absent key is treated as false by readers; int 0/1 rejected"},
+      "max_step_seconds": {"type": "int", "min": 1, "max": 86400, "note": "bool/float rejected"},
+      "attempt": {"type": "int", "min": 0, "max": 1000000, "default": 0, "note": "must be exactly 0 at enqueue; incremented durably by claim; preserved by requeue"},
+      "max_attempts": {"type": "int", "allowed_values": [1, 2], "default": 2, "note": "ONLY exact int 1 or 2; bool true/false, floats (2.0), strings, 0, and values > 2 are all rejected"},
+      "created_utc": {"type": "string", "format": "yyyy-MM-ddTHH:mm:ss.fffZ", "note": "regex plus real calendar validation (month 13 etc. rejected)"},
+      "payload_relpath": {"type": "string", "constraint": "relative to allowed_root; <=1024 chars; rejects absolute paths, empty/./.. segments, control chars, <>:\"|?* (which also blocks drive letters and NTFS alternate data streams), and Windows reserved device-name segments"},
+      "payload_sha256": {"type": "string", "pattern": "^[0-9A-F]{64}$", "note": "uppercase hex SHA-256 of the payload bytes; payload text never lives in the card"}
+    }
+  },
+  "exact_cas": {
+    "authority_digest": "lowercase SHA-256 of canonical sort-key compact ASCII JSON without a trailing newline for the normalized task card after defaults are materialized, excluding only the mutable attempt field",
+    "generation": "current attempt and expected next attempt are separate integers; the digest deliberately stays stable across an attempt bump",
+    "peek": "peek-exact returns one task-locked, semantically validated authority view for a task in any single durable state; worker is the exact durable claim owner for in_progress and null in every other state; corrupt history/attempt/marker evidence refuses instead of returning a view; executable states (queue, in_progress) keep the strict payload gate and refuse an unverifiable payload, while non-executable states (blocked/done/failed) report the payload verification outcome inside the view (verified:false plus the refusal code) so a quarantined card stays inspectable; it performs no queue-evidence mutation and contains no nonce",
+    "list": "list-exact returns sorted individually task-locked, semantically validated queue views with worker=null; any malformed queue entry or corrupt task evidence still fails the whole list closed (all-or-nothing head-of-line refusal, retained so dispatch cannot silently skip corrupt queued work). A payload-only verification failure on an otherwise semantically valid queue card does NOT abort the list: that entry is exposed deterministically with payload verified:false, error code, and path null, so one drifted payload cannot hide healthy tasks; each view is a claim input, not a globally atomic snapshot; it performs no queue-evidence mutation and contains no nonce",
+    "claim": "claim-exact accepts task_id + exact next attempt + authority digest + profile + model + worker; all are checked with state, budget, and payload under the per-task lock before the move",
+    "payload_quarantine": "audit reports exact_payload_unavailable with task_id, the durable authority digest, and next_attempt when an otherwise-valid queued card (marker-governed or still marker-free) has a missing/drifted payload. The digest is the immutable marker authority when a marker exists, otherwise the authority digest of the validated queue card written at enqueue. quarantine-exact-payload accepts only task_id + worker, derives digest and generation solely from that durable evidence, verifies that the current payload is unavailable, and publishes canonical exact block-payload evidence; for a marker-free queued card it first publishes the exact protocol marker (first_exact_attempt = attempt+1) under the same lock strictly before the state move, so a crash between the two leaves the admitted idempotent response-loss window. It never guesses authority from current payload bytes or a caller-supplied digest. A healthy marker-free card refuses exact-payload-not-drifted before any marker is published. An identical retry after response loss accepts only the matching canonical blocked tail and does not reread the payload; a marker-free non-queue card refuses exact-evidence-missing and stays on legacy verbs",
+    "corrupt_history_policy": "quarantine-exact-payload is task-targeted, so unrelated corrupt queue history does not prevent quarantining the named valid task. Corruption in the named task refuses without mutation, audit remains non-clean, and audit never labels the corrupt task exact_payload_unavailable. list-exact deliberately remains all-or-nothing fail-closed while any corrupt queued history is unresolved; only payload-only drift is exposed per-entry instead",
+    "requeue": "requeue-exact accepts task_id + exact current attempt + authority digest + worker and moves blocked -> queue while attempt < max_attempts. Authority and ownership are the durable exact blocked tail (terminal block or exact block-payload quarantine): the caller worker must equal that tail's worker and the digest must match the marker/card authority. A block-attempt-dir tail is never requeueable: its immutable collision directory a<attempt+1> cannot be removed or reused, so a re-armed claim would collide and quarantine again forever; it refuses exact-attempt-dir-not-requeueable before any mutation for every worker and the safe recovery is a new task_id. The payload must re-verify byte-exactly first; a still-drifted payload refuses exact-payload-not-restored without mutation. The published exact event preserves attempt and binds attempt_dir a<attempt+1> in move-then-event order, so a crash between the two stays a visible AUDIT_GAP that is never repaired. An identical retry after response loss accepts only the matching canonical requeue-exact queue tail and refuses every other worker; owner continuity is durable, not response-local: semantic validation and audit require every persisted requeue-exact event worker to equal the worker on its immediately preceding exact blocked tail, so an event-only worker rewrite fails closed (exact-evidence-invalid; audit exact_transition_inconsistency) instead of transferring ownership. Exhausted budget refuses max-attempts-exhausted; a marker-free blocked task refuses exact-evidence-missing and stays on legacy requeue; failed is unreachable because exact fail-final only happens with the budget exhausted",
+    "protocol_marker": {
+      "layout": "exact/<task_id>.json",
+      "closed_schema": {"version": 1, "task_id": "owning task id", "authority_digest": "lowercase SHA-256 card authority", "first_exact_attempt": "exact int 1 or 2", "prior_event_seq": "exact int 0..999999 equal to the contiguous event count immediately before marker publication"},
+      "canonical_bytes": "the marker must be the exact canonical compact sorted-key UTF-8 JSON encoding emitted by the queue; alternate ordering/whitespace, duplicate keys, malformed bytes, missing/extra keys, and non-exact types refuse",
+      "publication": "published with exclusive no-overwrite create while holding the task lock, after exact admission checks and before the first exact state move; prior_event_seq is captured from the already-validated contiguous chain under that lock; an existing matching marker is the only permitted response-loss replay",
+      "binding": "the immutable marker binds task_id, authority digest, first exact attempt, and the exact tail boundary independently of mutable event fields. Events at or before prior_event_seq are supported marker-free legacy history and must replay to queue at attempt first_exact_attempt-1; events after it are exact-governed. Exact metadata before/at the boundary, or omitted from a governed exact claim/pre-claim quarantine, is inconsistent",
+      "response_loss_window": "marker plus the unchanged queue state at attempt first_exact_attempt-1 is the valid no-event window; retry continues idempotently. At the same boundary, exact block-payload or block-attempt-dir is a canonical terminal quarantine. A conflicting durable marker is invalid semantic evidence; a conflict observed during exclusive marker publication refuses exact-protocol-conflict",
+      "immutability_limit": "the threat model detects event-only or card-only downgrade/tampering; a same-identity writer coherently replacing the marker, card, complete event chain, and attempt tree is outside this filesystem integrity model"
+    },
+    "semantic_admission": "before every exact mutation or replay and every authoritative exact read, one per-task validator under the existing task lock replays the full contiguous event chain and verifies legal from/to transitions, attempts, fail/requeue budget policy, current card state+attempt+authority, marker boundary/prefix consistency, first_exact_attempt <= max_attempts, exact ownership, and an exact complete attempt-directory index including a canonical exact collision directory; a requeue-exact event must be marker-governed, after the boundary, carry exact metadata, respect the budget, immediately follow an exact terminal block or exact block-payload tail (never block-attempt-dir), and carry exactly that predecessor's worker; any missing, malformed, extra, or inconsistent evidence refuses without repair",
+    "claim_replay": "an identical call succeeds in already-in_progress only when the current card, exact claim event, immutable attempt dir, payload, attempt, digest, profile, model, and worker all match",
+    "terminal": "complete-exact/fail-exact/block-exact require the exact attempt, digest, and worker owning the last exact claim; fail additionally requires a retry/final disposition equal to the card policy before mutation",
+    "terminal_replay": "an identical already-terminal transition succeeds only when the current card and tail exact event match and the fail disposition is recomputed from the current validated card; a conflicting transition, worker, attempt, digest, disposition, reason, or non-tail event refuses",
+    "exact_specific_refusals": [
+      "invalid-expected-attempt", "invalid-expected-digest",
+      "invalid-fail-disposition",
+      "exact-card-not-regular",
+      "exact-state-conflict", "exact-attempt-mismatch",
+      "exact-digest-mismatch", "exact-profile-mismatch",
+      "exact-model-mismatch", "exact-worker-mismatch",
+      "exact-reason-mismatch", "exact-evidence-missing",
+      "exact-evidence-invalid", "exact-transition-conflict",
+      "exact-payload-changed", "exact-attempt-dir-conflict",
+      "exact-transition-required", "exact-protocol-conflict",
+      "exact-payload-not-drifted", "exact-payload-not-restored",
+      "exact-attempt-dir-not-requeueable",
+      "max-attempts-exhausted",
+      "fail-disposition-mismatch"
+    ],
+    "shared_refusals": "root, card-schema, payload, worker/filter, invalid-arguments, and I/O errors retain the existing stable queue codes",
+    "legacy_guard": "legacy claim, complete, fail, block, and requeue run under the task lock and use full semantic validation whenever history evidence exists; malformed/incomplete evidence refuses exact-evidence-invalid. A marker may be admitted after valid marker-free legacy quarantine/requeue history, which remains a historical prefix and is not retroactively reinterpreted. Once the independent exact marker exists, every new legacy mutation refuses exact-transition-required even if exact fields were stripped from events or a worker field was rewritten",
+    "nonce": "no queue card, queue view, or queue event contains a nonce; any future dispatch nonce belongs to tick_state intent"
+  },
+  "payload_verification": {
+    "when": ["enqueue", "claim pre-rename", "claim post-rename (re-verify immediately before success)"],
+    "checks": [
+      "allowed_root resolves to an existing real directory",
+      "every relpath component is lstat-checked: any symlink, junction, or other reparse point anywhere on the walk is rejected",
+      "final component must be a regular file",
+      "size <= max_bytes before and during the bounded hash read",
+      "os.path.realpath containment backstop under allowed_root",
+      "SHA-256 of the full content must equal payload_sha256 exactly"
+    ],
+    "max_bytes": 4194304,
+    "on_failure_at_claim": "legacy claim quarantines queue -> blocked with a base block-payload event. If an exact marker already governs the queued card, claim-exact instead publishes canonical exact block-payload evidence (authority_digest plus the attempted next attempt_dir), including after a prior response was lost; it never leaves a clean but permanently unclaimable exact queue card. claim-exact on a still marker-free drifted card refuses without quarantining; the targeted quarantine command is the exact-protocol repair path for that case",
+    "restart_recovery": "audit re-verifies the payload of every otherwise-valid queued card -- marker-governed or still marker-free -- and reports exact_payload_unavailable instead of clean, carrying the durable authority digest (marker when present, otherwise the enqueue-validated card) and the next attempt. quarantine-exact-payload then performs the canonical quarantine using only that durable evidence, publishing the exact marker first for a marker-free card; a healthy payload refuses exact-payload-not-drifted. After quarantine the payload can be restored and the task re-armed with requeue-exact while budget remains"
+  },
+  "atomicity": {
+    "task_transaction": "every state-changing command holds a per-task cross-process OS file lock from its first authoritative read through state move, attempt mutation, and event publication; OS crash-release never repairs files, so a move/event crash remains an AUDIT_GAP",
+    "exact_protocol_publish": "the immutable exact/<task_id>.json marker is exclusively published under the same task lock before the first exact state move and records the exact pre-marker event boundary; a lost response before that move is an admitted idempotent retry window",
+    "state_transition": "single same-volume NO-OVERWRITE atomic rename of <task_id>.json between state directories (Windows os.rename refuses existing targets; POSIX uses link+unlink). The losing racer gets a filesystem error, never a duplicate claim, and an existing target card is never replaced.",
+    "card_rewrite": "temp file under <root>/tmp + os.replace, only for the owned in_progress attempt bump",
+    "event_publish": "temp file under <root>/tmp + exclusive no-overwrite rename/link into events/<task_id>/; an existing seq file can never be replaced; collisions rescan and retry, then fail closed",
+    "path_guard": "every state/events/attempts path component is validated against a closed name grammar and lstat-checked for symlink/junction/reparse points before any read or write"
+  },
+  "events": {
+    "layout": "events/<task_id>/<seq:06d>.json, append-only, one file per seq",
+    "seq": "per-task, contiguous from 1; derived as max(existing)+1, never len()+1; published with exclusive create so an existing seq cannot be overwritten",
+    "closed_schema": "one of two closed shapes: base keys, or base keys plus both exact authority_digest and attempt_dir. The exact pair is valid on claim/complete/fail-retry/fail-final/block, on exact pre-claim block-payload/block-attempt-dir, and on requeue-exact (where it is mandatory); it is rejected on block-malformed and the legacy requeue transitions",
+    "keys": {
+      "version": {"type": "int", "const": 1},
+      "task_id": {"type": "string", "const": "owning task id"},
+      "seq": {"type": "int", "min": 1, "max": 999999, "note": "must equal both its position in the chain and its file name"},
+      "transition": {"type": "string", "enum": "transitions table"},
+      "from_state": {"type": "string", "constraint": "must equal the transition table entry"},
+      "to_state": {"type": "string", "constraint": "must equal the transition table entry"},
+      "attempt": {"type": "int", "min": 0, "max": 1000000},
+      "worker": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
+      "reason": {"type": "string", "pattern": "^[ -~]{0,256}$", "note": "non-empty required for block/block-malformed/block-payload/block-attempt-dir"},
+      "recorded_utc": {"type": "string", "format": "yyyy-MM-ddTHH:mm:ss.fffZ"},
+      "authority_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$", "optional_pair": "present together with attempt_dir on exact claim/terminal evidence, exact block-payload/block-attempt-dir, and requeue-exact; forbidden on block-malformed and legacy requeue events"},
+      "attempt_dir": {"type": "string", "constraint": "when present on claim/terminal evidence, exactly a<event.attempt>; on exact block-payload/block-attempt-dir and requeue-exact, exactly a<event.attempt+1>; present together with authority_digest"}
+    },
+    "ordering": "published strictly AFTER the state transition while the same per-task OS lock remains held; a crash between the two releases the lock and leaves a visible AUDIT_GAP, never silently repaired"
+  },
+  "attempt_dirs": {
+    "layout": "attempts/<task_id>/a<N>/ with N starting at 1",
+    "creation": "exclusive os.mkdir during claim, after payload re-verify and before the card attempt bump; a pre-existing directory a<N> fails exact claim closed with rollback plus canonical exact block-attempt-dir whose bound collision directory remains expected immutable evidence; that quarantine is terminal for the task identity (requeue-exact refuses exact-attempt-dir-not-requeueable); an unsafe/non-directory collision is an unrecoverable I/O divergence",
+    "immutability": "attempt dirs are never reused and never renumbered; a permitted requeue preserves attempt so the next claim creates a fresh a<N+1>; requeue is refused once attempt >= max_attempts"
+  },
+  "claim_ordering_and_crash_windows": {
+    "order": [
+      "validate card schema (malformed -> block-malformed quarantine)",
+      "verify payload (legacy bad -> base block-payload quarantine; bad on an already exact-managed queued card -> canonical exact block-payload quarantine)",
+      "for claim-exact: exclusively publish or verify exact/<task_id>.json before the first exact state mutation",
+      "atomic no-overwrite rename queue -> in_progress (single winner)",
+      "re-verify payload (bad -> rollback + block-payload quarantine)",
+      "exclusive mkdir attempts/<task>/a<N> (exists -> rollback + block-attempt-dir quarantine)",
+      "rewrite card with attempt=N",
+      "publish claim event",
+      "print success JSON (the ONLY signal that a claim is executable)"
+    ],
+    "documented_windows": {
+      "crash_after_rename_before_card_rewrite": "in_progress card with stale attempt and no claim event -> audit state_mismatch (or attempt_without_events)",
+      "crash_after_mkdir_before_card_rewrite": "extra a<N> dir -> audit extra_attempt_dir",
+      "crash_after_card_rewrite_before_event": "card attempt ahead of claim events -> audit card_attempt_mismatch",
+      "posix_link_unlink_window": "card visible in two state dirs -> audit duplicate_states"
+    }
+  },
+  "audit": {
+    "semantics": "discovers task identities, acquires their per-task locks in sorted order, retries discovery until it has one stable locked snapshot, then replays every event chain from (queue, attempt=0) and independently compares the replayed truth against the exactly-one state card, its attempt field, immutable exact marker and its legacy-prefix boundary, and immutable attempt dirs; it verifies first_exact_attempt <= max_attempts, serializes with queue mutations, and never repairs evidence",
+    "exit": "3 with {\"audit\": \"AUDIT_GAP\"} when any gap exists, 0 when clean",
+    "detected_gaps": [
+      "layout", "unexpected_entry", "duplicate_states", "orphan_events",
+      "orphan_attempts", "malformed_card", "malformed_event", "broken_seq",
+      "event_chain_too_long", "illegal_transition", "from_to_mismatch",
+      "attempt_mismatch", "state_mismatch", "attempt_without_events",
+      "card_attempt_mismatch", "missing_attempt_dir", "extra_attempt_dir",
+      "attempt_budget_violation", "card_authority_mismatch",
+      "exact_transition_inconsistency", "orphan_exact_protocol",
+      "malformed_exact_protocol", "exact_protocol_conflict",
+      "exact_protocol_missing", "exact_protocol_inconsistency",
+      "exact_payload_unavailable"
+    ],
+    "malformed_card_exception": "an unreadable card in blocked/ whose final event is block-malformed is a KNOWN quarantined state, not a gap"
+  },
+  "fail_policy": "CLI fail is the single supervisor retry path from in_progress: back to queue while attempt < max_attempts (fail-retry), else to failed (fail-final); with the default max_attempts=2 the second failure is final. Legacy requeue is the operator path only while the task is still marker-free, may precede later exact admission, requires attempt < max_attempts, and preserves attempt. Exact-marked tasks must stay on exact verbs and cannot append a legacy requeue; requeue-exact is their blocked -> queue operator path while attempt < max_attempts, owned by the exact blocked tail (terminal block or exact block-payload; a block-attempt-dir quarantine is permanently terminal for the task identity) and gated on byte-exact payload restoration. Exhausted work requires a new task_id.",
+  "runner_boundary": {
+    "trusted_code": "every manifest-listed Python module is reviewed trusted code and part of the TCB; payloads or hostile Python are never admitted to this manifest",
+    "required_modules": ["autonomy/__init__.py", "autonomy/boot_clock.py", "autonomy/runner.py", "autonomy/supervisor_tick.py"],
+    "finder_guarantee": "ordinary autonomy imports resolve only to bootstrap-verified in-memory bytes; an absent listed dependency fails closed with no ordinary filesystem fallback",
+    "not_a_sandbox": "the finder and scheduler AST closure are integrity/determinism controls and defence-in-depth lint, not a capability sandbox against Python already executing in-process",
+    "handoff": "the loader injects one fresh private one-shot object into runner; it detects accidental direct invocation/replay only and is not cryptographic provenance",
+    "readiness_tick": "the currently admitted supervisor_tick is a deterministic no-op and performs no queue, process, scheduler, network, SVN, or product mutation",
+    "boot_clock": "autonomy/boot_clock.py is a mandatory pinned dependency root and closure root: an absent or drifted entry fails validation closed before any Create or trusted runner execution. The module itself is a producer-only, UNINTEGRATED boot-clock component: WindowsBootClock().sample() pairs the raw 16-byte kernel boot-environment identifier (NtQuerySystemInformation class 90, accepted only on status 0 with ReturnLength 32, all-zero identifier refused, epoch = raw bytes hex, never a GUID rendering) with one time.monotonic_ns() observation bracketed by two identical identifier queries. Nothing in the autonomy runtime consumes a reading yet; a reading is NOT a cross-reboot ordering guarantee and grants NO live or deploy authority. The rejected clock-epoch integration architecture (seal_task, tick_core epoch propagation, scheduler epoch checks, residue policy) is deliberately not implemented. Non-win32 platforms fail closed before any WinDLL access; there is no cache, wall-clock, WMI, uptime, random, registry, environment or persisted-file fallback"
+  },
+  "enqueue_rules": [
+    "card file must be an absolute existing path",
+    "attempt must be exactly 0",
+    "payload is verified (containment + sha256) before the card enters queue/",
+    "task_id must not exist in any state directory and must have no leftover events/, attempts/, or exact/ marker residue",
+    "the queue card is published with exclusive no-overwrite create"
+  ]
+}

@@ -23,7 +23,7 @@ UNKNOWN by comparing a deterministic semantic projection of the registered
 definition against this attempt's durable XML contract.  ``schtasks`` cannot
 distinguish "no such task" from any other failure without parsing localized
 text, so absence is trusted only from the narrow read-only COM adapter's exact
-not-found HRESULTs — never from a nonzero or localized CLI result.
+not-found HRESULTs -- never from a nonzero or localized CLI result.
 ``ensure_registered`` and ``ensure_absent`` are the idempotent replay entry
 points: a matching existing task is success, a conflicting or differently
 bound same-name task fails closed, and a create/delete response loss is
@@ -102,6 +102,7 @@ _XML_DECL_ENCODING_RE: Final[re.Pattern[str]] = re.compile(
 _REQUIRED_DEPENDENCY_PATHS: Final[frozenset[str]] = frozenset(
     {
         "autonomy/__init__.py",
+        "autonomy/boot_clock.py",
         "autonomy/runner.py",
         "autonomy/supervisor_tick.py",
     }
@@ -735,6 +736,7 @@ def _verify_dependency_closure(
 
     required_modules = {
         "autonomy",
+        "autonomy.boot_clock",
         "autonomy.runner",
         "autonomy.supervisor_tick",
     }
@@ -1873,8 +1875,8 @@ class _ComTaskQueryPort:
     ``schtasks.exe`` reports every query failure as a localized message with
     an undifferentiated nonzero exit, so it has no defensible absence signal.
     ``ITaskFolder::GetTask`` returns exact, unlocalized not-found HRESULTs;
-    only those become ABSENT.  Every other failure — COM init, connect,
-    marshalling, unreadable definition — is UNKNOWN or an unreadable-PRESENT,
+    only those become ABSENT.  Every other failure -- COM init, connect,
+    marshalling, unreadable definition -- is UNKNOWN or an unreadable-PRESENT,
     never ABSENT.  The port performs no mutation: only ``Connect``,
     ``GetFolder``, ``GetTask`` and ``get_Xml`` are ever invoked.
     """

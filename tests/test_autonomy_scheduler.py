@@ -115,6 +115,10 @@ class SchedulerFixture(unittest.TestCase):
         self.supervisor.write_text(
             "def run(context):\n    return 0\n", encoding="utf-8"
         )
+        self.boot_clock = autonomy / "boot_clock.py"
+        self.boot_clock.write_text(
+            "MAX_NS = (2 ** 63) - 1\n", encoding="utf-8"
+        )
 
         self.config = self.root / "runner-config.json"
         self.config.write_text('{"safe":true}\n', encoding="utf-8")
@@ -141,6 +145,8 @@ class SchedulerFixture(unittest.TestCase):
         selected = list(paths)
         if self.supervisor not in selected:
             selected.append(self.supervisor)
+        if self.boot_clock not in selected:
+            selected.append(self.boot_clock)
         write_manifest(
             self.manifest,
             [
@@ -476,12 +482,17 @@ class DurableAuthorityTests(SchedulerFixture):
         self.assertEqual(
             {
                 "autonomy/__init__.py",
+                "autonomy/boot_clock.py",
                 "autonomy/runner.py",
                 "autonomy/supervisor_tick.py",
             },
             set(dependencies),
         )
         self.assertEqual(sha256(self.runner), dependencies["autonomy/runner.py"]["sha256"])
+        self.assertEqual(
+            sha256(self.boot_clock),
+            dependencies["autonomy/boot_clock.py"]["sha256"],
+        )
 
     def test_dependency_drift_fails_before_create(self) -> None:
         paths = self.make_paths()
@@ -502,6 +513,30 @@ class DependencyManifestTests(SchedulerFixture):
         with self.assertRaises(PathValidationError) as captured:
             self.make_paths()
         self.assertEqual("manifest-required-entry-missing", captured.exception.code)
+
+    def test_missing_boot_clock_entry_fails_closed_before_create(self) -> None:
+        # A manifest without the mandatory boot-clock dependency root must be
+        # refused during validation, so no Create can ever be reached.
+        write_manifest(
+            self.manifest,
+            [
+                {"path": self.relative(path), "sha256": sha256(path)}
+                for path in (self.package_init, self.runner, self.supervisor)
+            ],
+        )
+        with mock.patch("autonomy.scheduler.subprocess.run") as run:
+            with self.assertRaises(PathValidationError) as captured:
+                self.make_paths()
+        run.assert_not_called()
+        self.assertEqual("manifest-required-entry-missing", captured.exception.code)
+
+    def test_exact_boot_clock_is_required_root_and_drift_blocks_create(self) -> None:
+        paths = self.make_paths()
+        self.boot_clock.write_text("MAX_NS = 5\n", encoding="utf-8")
+        with mock.patch("autonomy.scheduler.subprocess.run") as run:
+            with self.assertRaises(PathValidationError):
+                self.adapter().register(self.identity, paths)
+        run.assert_not_called()
 
     def test_missing_direct_autonomy_import_is_rejected(self) -> None:
         self.runner.write_text("import autonomy.helper\n", encoding="utf-8")
@@ -982,7 +1017,7 @@ class ExactObservationTests(ExactBoundaryFixture):
             "empty": b"",
             "truncated": exact[: len(exact) // 2],
             "localized-error-text": (
-                "ERREUR : la tâche spécifiée est introuvable.".encode("cp1252")
+                "ERREUR : la t\u00e2che sp\u00e9cifi\u00e9e est introuvable.".encode("cp1252")
             ),
             "wrong-namespace": b"<Task version='1.2'/>",
             "doctype": b"<!DOCTYPE Task []>" + exact,
@@ -1131,7 +1166,7 @@ class ExactObservationTests(ExactBoundaryFixture):
 
     def test_probe_result_ambiguity_fails_closed(self) -> None:
         cases = {
-            "localized-string": "PRÉSENTE",
+            "localized-string": "PR\u00c9SENTE",
             "plain-status": TaskProbe("present", None),  # type: ignore[arg-type]
             "xml-on-absent": TaskProbe(TaskProbeStatus.ABSENT, b"<Task/>"),
             "xml-on-unknown": TaskProbe(TaskProbeStatus.UNKNOWN, b""),
@@ -1225,7 +1260,7 @@ class EnsureRegisteredTests(ExactBoundaryFixture):
 
     def test_create_response_loss_resolved_only_by_exact_inspection(self) -> None:
         localized = self.completed(
-            1, stderr="ERREUR : la tâche existe déjà.".encode("cp1252")
+            1, stderr="ERREUR : la t\u00e2che existe d\u00e9j\u00e0.".encode("cp1252")
         )
         failures: dict[str, object] = {
             "nonzero-localized": localized,
@@ -1378,7 +1413,7 @@ class EnsureAbsentTests(ExactBoundaryFixture):
 
     def test_delete_response_loss_resolved_by_reinspection(self) -> None:
         localized = self.completed(
-            1, stderr="ERREUR : la tâche spécifiée est introuvable.".encode("cp1252")
+            1, stderr="ERREUR : la t\u00e2che sp\u00e9cifi\u00e9e est introuvable.".encode("cp1252")
         )
         failures: dict[str, object] = {
             "nonzero-localized": localized,

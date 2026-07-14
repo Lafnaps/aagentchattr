@@ -112,6 +112,17 @@ class CacheCase(unittest.TestCase):
 
 
 class CapacityDecisionTests(CacheCase):
+    def test_exact_model_aliases(self) -> None:
+        self.assertEqual(
+            {
+                "fable-5": capacity.ModelFamily.FABLE,
+                "claude-fable-5": capacity.ModelFamily.FABLE,
+                "opus-4.8": capacity.ModelFamily.OPUS,
+                "claude-opus-4-8": capacity.ModelFamily.OPUS,
+            },
+            dict(capacity.MODEL_FAMILIES),
+        )
+
     def test_opus_uses_minimum_of_general_windows(self) -> None:
         snapshot = self.load(document(account(five_used=26, week_used=54)))
         result = capacity.decide(
@@ -127,7 +138,7 @@ class CapacityDecisionTests(CacheCase):
     def test_opus_decimal_percentage_is_not_rounded(self) -> None:
         snapshot = self.load(document(account(five_used=10.1, week_used=53.25)))
         result = capacity.decide(
-            snapshot, profile="claude-work", model="claude-opus-4.8"
+            snapshot, profile="claude-work", model="claude-opus-4-8"
         )
         self.assertEqual(Decimal("46.75"), result.effective_remaining_pct)
 
@@ -255,6 +266,16 @@ class CapacityDecisionTests(CacheCase):
         self.assertIs(result.reason, capacity.CapacityReason.FABLE_RESERVE)
 
     def test_exact_public_profile_aliases(self) -> None:
+        self.assertEqual(
+            {
+                "claude": ".claude",
+                "claude-work": ".claude-work",
+                "claude-test1": ".claude-test1",
+                "claude-test2": ".claude-test2",
+                "claude-test3": ".claude-test3",
+            },
+            dict(capacity.PROFILE_ALIASES),
+        )
         accounts = [account(cache) for cache in capacity.PROFILE_ALIASES.values()]
         snapshot = self.load(document(*accounts))
         for public in capacity.PROFILE_ALIASES:
@@ -270,7 +291,9 @@ class CapacityDecisionTests(CacheCase):
         cases = (
             (".claude-work", "opus-4.8", "profile-binding-unknown"),
             ("claude-work", "opus", "model-binding-unknown"),
+            ("claude-work", "claude-opus-4.8", "model-binding-unknown"),
             ("claude-work", "claude-opus-4.1", "model-binding-unknown"),
+            ("claude-main", "opus-4.8", "profile-binding-unknown"),
             ("claude-Work", "opus-4.8", "profile-binding-unknown"),
         )
         for profile, model, code in cases:
@@ -411,10 +434,14 @@ class StrictSchemaTests(CacheCase):
                 value["SchemaVersion"] = version
                 self.error("cache-version-invalid", value)
 
-    def test_unknown_claude_profile_is_ignored_not_aliased(self) -> None:
-        unknown = {"Provider": "claude", "Profile": ".claude-test3"}
-        snapshot = self.load(document(unknown, account()))
-        self.assertEqual({".claude-work"}, set(snapshot.accounts))
+    def test_test3_is_known_and_unknown_claude_profile_is_ignored(self) -> None:
+        unknown = {"Provider": "claude", "Profile": ".claude-test4"}
+        snapshot = self.load(
+            document(unknown, account(), account(".claude-test3"))
+        )
+        self.assertEqual(
+            {".claude-work", ".claude-test3"}, set(snapshot.accounts)
+        )
 
     def test_known_account_schema_is_closed(self) -> None:
         value = account()

@@ -59,10 +59,11 @@ class ModelFamily(str, Enum):
 # whose quota semantics are unknown.
 PROFILE_ALIASES: Mapping[str, str] = MappingProxyType(
     {
-        "claude-main": ".claude",
+        "claude": ".claude",
         "claude-work": ".claude-work",
         "claude-test1": ".claude-test1",
         "claude-test2": ".claude-test2",
+        "claude-test3": ".claude-test3",
     }
 )
 MODEL_FAMILIES: Mapping[str, ModelFamily] = MappingProxyType(
@@ -70,7 +71,7 @@ MODEL_FAMILIES: Mapping[str, ModelFamily] = MappingProxyType(
         "fable-5": ModelFamily.FABLE,
         "claude-fable-5": ModelFamily.FABLE,
         "opus-4.8": ModelFamily.OPUS,
-        "claude-opus-4.8": ModelFamily.OPUS,
+        "claude-opus-4-8": ModelFamily.OPUS,
     }
 )
 

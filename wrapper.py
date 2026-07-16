@@ -1386,8 +1386,38 @@ def _call_inject_bounded(inject_fn, prompt: str, timeout_seconds: float):
     return outcome.get("result")
 
 
+def _inject_retry_after(inject_fn) -> float:
+    """Read the optional injector backoff without mutating durable state."""
+    hook = getattr(inject_fn, "retry_after", None)
+    if not callable(hook):
+        return 0.0
+    value = float(hook())
+    if value != value or value < 0.0 or value > 60.0:
+        raise ValueError("injector retry_after must be finite in range 0..60")
+    return value
+
+
+def _inject_recovery_ready(inject_fn) -> bool:
+    """Run the optional read-only recovery probe before journal admission."""
+    hook = getattr(inject_fn, "recovery_probe", None)
+    if not callable(hook):
+        return True
+    ready = hook()
+    if not isinstance(ready, bool):
+        raise ValueError("injector recovery_probe must return bool")
+    return ready
+
+
 class _WatcherDefer(Exception):
     """Internal: defer this watcher iteration without consuming anything."""
+
+    def __init__(self, retry_after: float = 0.0):
+        super().__init__(retry_after)
+        try:
+            value = float(retry_after)
+        except (TypeError, ValueError):
+            value = 0.0
+        self.retry_after = min(60.0, max(0.0, value))
 
 
 def _capture_identity(get_identity_fn, get_token_fn):
@@ -1501,6 +1531,18 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                         f"bytes); manual replay required.", flush=True,
                     )
             elif triggers:
+                # A cancelled/error episode owns its own monotonic backoff.
+                # Respect it before preparing/reading/appending the delivery
+                # journal.  When due, the optional hook performs only a
+                # read-only composer probe; failed recovery likewise defers
+                # before the journal transaction.  Queue bytes and cursor are
+                # therefore preserved without high-rate "attempting" churn.
+                retry_after = _inject_retry_after(inject_fn)
+                if retry_after > 0.0:
+                    raise _WatcherDefer(retry_after)
+                if not _inject_recovery_ready(inject_fn):
+                    raise _WatcherDefer(_inject_retry_after(inject_fn))
+
                 all_events = _prepare_delivery_events(
                     queue0, triggers, record_offsets
                 )
@@ -2106,6 +2148,10 @@ def main():
 
         def _report_safeguard_event(event: dict):
             action = event.get("action", "unknown")
+            if action == "injection-recovery-watchdog":
+                # _make_safeguard_emitter already persisted this event.  It is
+                # intentionally audit-only: never post it to chat.
+                return
             attempt = event.get("attempt", 0)
             fingerprint = event.get("fingerprint", "unknown")
             current_name, _ = get_identity()

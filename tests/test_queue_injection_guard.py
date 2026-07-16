@@ -497,6 +497,95 @@ class InjectAttemptTests(unittest.TestCase):
             sorted(classifications), ["busy", "nonempty-composer"]
         )
 
+    def test_cancelled_and_error_episodes_alert_once_probe_and_rearm(self):
+        """Blocked episodes use 2..60s probes and never retype before recovery."""
+        guard = wrapper_windows._ComposerAdmissionGuard("claude")
+        events = []
+        now = [0.0]
+        cancelled_a = {
+            "status": "cancelled",
+            "event": {
+                "action": "injection-enter-cancelled",
+                "classification": "strict",
+                "fingerprint": "episode-a",
+            },
+        }
+        error_b = {
+            "status": "error",
+            "event": {
+                "action": "injection-error",
+                "error_type": "OSError",
+                "fingerprint": "episode-b",
+            },
+        }
+        injector = wrapper_windows._make_admitted_injector(
+            composer_guard=guard,
+            safeguard_guard=True,
+            emit=events.append,
+            monotonic=lambda: now[0],
+        )
+
+        with mock.patch.object(
+            wrapper_windows, "_injection_attempt",
+            side_effect=[cancelled_a, {"status": "injected"}, error_b],
+        ) as attempt, mock.patch.object(
+            wrapper_windows, "_read_visible_console_text",
+            side_effect=[SAFEGUARD_MENU, FABLE_IDLE, FABLE_IDLE],
+        ) as read_screen:
+            self.assertEqual(injector("task"), "cancelled")
+            self.assertEqual(injector.retry_after(), 2.0)
+            now[0] = 1.0
+            self.assertEqual(injector("task"), "deferred")
+            self.assertEqual(attempt.call_count, 1)
+            self.assertEqual(read_screen.call_count, 0)
+
+            # First due probe still sees the safeguard; next delay doubles.
+            now[0] = 2.0
+            self.assertEqual(injector("task"), "deferred")
+            self.assertEqual(injector.retry_after(), 4.0)
+            self.assertEqual(attempt.call_count, 1)
+
+            # Stable-empty requires two independent read-only sightings.
+            now[0] = 6.0
+            self.assertEqual(injector("task"), "deferred")
+            self.assertEqual(injector.retry_after(), 8.0)
+            now[0] = 14.0
+            self.assertEqual(injector("task"), "injected")
+            self.assertEqual(attempt.call_count, 2)
+            self.assertEqual(read_screen.call_count, 3)
+
+            # A subsequent error is a new episode and is independently
+            # deduped/armed; it cannot be retried immediately either.
+            self.assertEqual(injector("task"), "error")
+            self.assertEqual(injector("task"), "deferred")
+            self.assertEqual(attempt.call_count, 3)
+
+        self.assertEqual(
+            [event["action"] for event in events],
+            [
+                "injection-enter-cancelled",
+                "injection-recovery-watchdog",
+                "injection-error",
+                "injection-recovery-watchdog",
+            ],
+        )
+        self.assertEqual(
+            [
+                event["fingerprint"] for event in events
+                if event["action"] != "injection-recovery-watchdog"
+            ],
+            ["episode-a", "episode-b"],
+        )
+        watchdogs = [
+            event for event in events
+            if event["action"] == "injection-recovery-watchdog"
+        ]
+        self.assertEqual(len(watchdogs), 2)
+        self.assertTrue(all(event["retry_after_seconds"] == 2.0
+                            for event in watchdogs))
+        self.assertTrue(all(event["max_retry_seconds"] == 60.0
+                            for event in watchdogs))
+
 
 class QueueCursorTests(unittest.TestCase):
     """id2099 H2: content-bound cursor; strict decode; quarantine."""
@@ -893,6 +982,64 @@ class WatcherDurabilityTests(unittest.TestCase):
 
                 self._run_watcher(inject_fn, done)
                 self.assertEqual(self._cursor_offset(), 0)
+
+    def test_retry_after_defers_before_delivery_journal(self):
+        payload = b'{"channel": "lane-test1"}\n'
+        self.queue.write_bytes(payload)
+        observed = threading.Event()
+
+        class BackedOffInjector:
+            def __call__(self, _prompt):
+                raise AssertionError("must not inject while retry_after is positive")
+
+            def retry_after(self):
+                observed.set()
+                return 30.0
+
+            def recovery_probe(self):
+                raise AssertionError("probe must wait for its deadline")
+
+        injector = BackedOffInjector()
+        with mock.patch.object(
+            wrapper, "_read_delivery_indexes"
+        ) as read_journal, mock.patch.object(
+            wrapper, "_append_delivery_transition"
+        ) as append_journal:
+            self._run_watcher(injector, observed)
+        read_journal.assert_not_called()
+        append_journal.assert_not_called()
+        self.assertEqual(self.queue.read_bytes(), payload)
+        self.assertEqual(self._cursor_offset(), 0)
+
+    def test_due_failed_recovery_probe_defers_before_delivery_journal(self):
+        payload = b'{"channel": "lane-test1"}\n'
+        self.queue.write_bytes(payload)
+        observed = threading.Event()
+        state = {"delay": 0.0}
+
+        class RecoveringInjector:
+            def __call__(self, _prompt):
+                raise AssertionError("must not inject before stable-empty")
+
+            def retry_after(self):
+                return state["delay"]
+
+            def recovery_probe(self):
+                state["delay"] = 4.0
+                observed.set()
+                return False
+
+        injector = RecoveringInjector()
+        with mock.patch.object(
+            wrapper, "_read_delivery_indexes"
+        ) as read_journal, mock.patch.object(
+            wrapper, "_append_delivery_transition"
+        ) as append_journal:
+            self._run_watcher(injector, observed)
+        read_journal.assert_not_called()
+        append_journal.assert_not_called()
+        self.assertEqual(self.queue.read_bytes(), payload)
+        self.assertEqual(self._cursor_offset(), 0)
 
     def test_rules_fetch_failure_defers_without_consuming(self):
         # id2099 H4: transport failure => no context-less injection.

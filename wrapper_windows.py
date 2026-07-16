@@ -323,10 +323,52 @@ def _injection_attempt(text: str, *, delay: float = 0.3,
     }
 
 
+def _probe_injection_admission(*, safeguard_guard: bool,
+                               composer_guard) -> dict:
+    """Read-only recovery probe; never sends text or Enter.
+
+    The same fail-closed ordering as _injection_attempt is used, but a
+    positive stable-empty result is returned to the watcher instead of
+    immediately attempting delivery.  This is the only way a blocked
+    cancellation/error episode can become eligible for another attempt.
+    """
+    read_error_type = None
+    with _inject_lock:
+        try:
+            screen = _read_visible_console_text()
+        except Exception as exc:
+            screen = ""
+            read_error_type = type(exc).__name__
+        if read_error_type:
+            classification = "unreadable"
+            if composer_guard is not None:
+                composer_guard.reset_stability()
+        elif safeguard_guard and _screen_blocks_safeguard_input(screen):
+            classification = (
+                _classify_fable_safeguard_screen(screen) or "pointer-like"
+            )
+            if composer_guard is not None:
+                composer_guard.reset_stability()
+        elif composer_guard is None:
+            # A blocked episode cannot be recovered by guessing that an
+            # unknown composer is empty.
+            classification = "unrecognized-composer"
+        else:
+            classification = composer_guard.classify(screen)
+    return {
+        "ready": classification == "admit",
+        "classification": classification,
+        **({"error_type": read_error_type} if read_error_type else {}),
+    }
+
+
 def _make_admitted_injector(*, delay: float = 0.3,
                             enter_backend: str = "console_input",
                             safeguard_guard: bool = False,
-                            composer_guard=None, emit=None):
+                            composer_guard=None, emit=None,
+                            blocked_probe_initial_seconds: float = 2.0,
+                            blocked_probe_max_seconds: float = 60.0,
+                            monotonic=None):
     """Build the queue-watcher injector for the fail-closed admission gate.
 
     Single attempt per call (no internal deferral loop): the watcher owns the
@@ -334,9 +376,98 @@ def _make_admitted_injector(*, delay: float = 0.3,
     triggers arriving during a deferral join the next batch instead of being
     lost. Returns the attempt status string; "injected" is the only result
     that lets the watcher consume the batch. Deferral alerts are deduped per
-    classification episode via the composer guard."""
+    classification episode via the composer guard.
+
+    If text was typed but Enter was cancelled because a safeguard menu
+    appeared, the durable queue remains pending but the injector enters a
+    blocked-composer episode.  It emits that cancellation/error once, then performs
+    read-only recovery probes with exponential backoff.  No text or Enter is
+    attempted again until the admission guard has positively observed a
+    stable empty composer.  The watcher can query retry_after() and call
+    recovery_probe() before touching its journal.  One audit-only watchdog
+    record is emitted per episode; it is not a chat notification.
+    """
+
+    clock = monotonic or time.monotonic
+    probe_initial = min(60.0, max(2.0, float(blocked_probe_initial_seconds)))
+    probe_max = min(
+        60.0, max(probe_initial, float(blocked_probe_max_seconds))
+    )
+    blocked_episode = False
+    next_probe_at = 0.0
+    probe_delay = probe_initial
+    episode_fingerprint = ""
+
+    def _schedule_probe(now: float, *, first: bool = False) -> None:
+        nonlocal next_probe_at, probe_delay
+        probe_delay = (
+            probe_initial if first else min(probe_max, probe_delay * 2.0)
+        )
+        next_probe_at = now + probe_delay
+
+    def _reset_blocked_episode() -> None:
+        nonlocal blocked_episode, next_probe_at, probe_delay
+        nonlocal episode_fingerprint
+        blocked_episode = False
+        next_probe_at = 0.0
+        probe_delay = probe_initial
+        episode_fingerprint = ""
+
+    def _retry_after() -> float:
+        if not blocked_episode:
+            return 0.0
+        return max(0.0, next_probe_at - clock())
+
+    def _enter_blocked_episode(result: dict) -> None:
+        nonlocal blocked_episode, episode_fingerprint
+        if blocked_episode:
+            return
+        blocked_episode = True
+        event = result.get("event") or {}
+        episode_fingerprint = str(event.get("fingerprint") or "unknown")
+        _schedule_probe(clock(), first=True)
+        if emit:
+            # This is the single operator-facing notification for the
+            # cancellation/error episode.
+            emit(event)
+            # The wrapper callback deliberately treats this second record as
+            # audit-only.  It proves the bounded watchdog was armed without
+            # creating another chat message.
+            emit({
+                "action": "injection-recovery-watchdog",
+                "classification": event.get(
+                    "classification", result.get("status", "unknown")
+                ),
+                "fingerprint": episode_fingerprint,
+                "retry_after_seconds": probe_initial,
+                "max_retry_seconds": probe_max,
+            })
+
+    def _recovery_probe() -> bool:
+        """Return True only after a due, read-only stable-empty probe."""
+        if not blocked_episode:
+            return True
+        now = clock()
+        if now < next_probe_at:
+            return False
+        result = _probe_injection_admission(
+            safeguard_guard=safeguard_guard,
+            composer_guard=composer_guard,
+        )
+        if result["ready"]:
+            _reset_blocked_episode()
+            return True
+        _schedule_probe(clock())
+        return False
 
     def _run(text: str) -> str:
+        # Direct callers are protected too.  The queue watcher normally calls
+        # retry_after()/recovery_probe() before beginning its journal
+        # transaction; this fallback preserves the same no-retype invariant.
+        if blocked_episode:
+            if _retry_after() > 0.0 or not _recovery_probe():
+                return "deferred"
+
         result = _injection_attempt(
             text,
             delay=delay,
@@ -346,10 +477,12 @@ def _make_admitted_injector(*, delay: float = 0.3,
         )
         status = result["status"]
         if status == "injected":
+            _reset_blocked_episode()
             return status
         if status == "injected-uncertain":
             # Terminal: consumed by the watcher, never retried; alerted for
             # manual confirmation.
+            _reset_blocked_episode()
             if emit:
                 emit(result["event"])
             return status
@@ -362,12 +495,21 @@ def _make_admitted_injector(*, delay: float = 0.3,
             if emit and should_alert:
                 emit(result["event"])
             return status
-        # error / cancelled: always alert; the durable queue keeps the batch
-        # and the composer gate blocks re-typing until the screen is clean.
+        if status in ("cancelled", "error"):
+            # Both outcomes may leave text in the composer.  They therefore
+            # start the same deduped fail-closed episode; no retry is possible
+            # until the read-only recovery probe proves stable-empty.
+            _enter_blocked_episode(result)
+            return status
         if emit:
             emit(result["event"])
         return status
 
+    # Small duck-typed protocol consumed by wrapper._queue_watcher.  Keeping
+    # it on the callable preserves compatibility with existing start_watcher
+    # and legacy injectors.
+    _run.retry_after = _retry_after
+    _run.recovery_probe = _recovery_probe
     return _run
 
 

@@ -27,6 +27,11 @@ from registry import RuntimeRegistry
 from migration_lease import MigrationLeaseError, MigrationLeaseStore
 from session_store import SessionStore, validate_session_template
 from session_engine import SessionEngine
+from health_snapshot import (
+    build_health_snapshot,
+    degraded_health_snapshot,
+    is_loopback_peer,
+)
 from channel_policy import (
     CHANNEL_CATALOG_LOCK,
     CHANNEL_NAME_RE,
@@ -891,6 +896,14 @@ def _install_security_middleware(token: str, cfg: dict):
             # The index page injects the token client-side via same-origin script.
             # Uploads use random filenames and have path-traversal protection.
             if path == "/" or path.startswith(("/static/", "/uploads/", "/api/roles")):
+                return await call_next(request)
+
+            # Monitoring gets one unauthenticated, bounded snapshot. Trust only
+            # the ASGI socket peer; forwarded headers are deliberately ignored.
+            if path == "/api/health":
+                client_ip = request.client.host if request.client else ""
+                if not is_loopback_peer(client_ip):
+                    return JSONResponse({"error": "forbidden"}, status_code=403)
                 return await call_next(request)
 
             # Agent registration/heartbeat: loopback only (no remote agent minting).
@@ -2867,6 +2880,19 @@ async def get_status():
     channels = _settings_snapshot().get("channels", ["general"])
     status["paused"] = any(router.is_paused(ch) for ch in channels)
     return status
+
+
+@app.get("/api/health")
+async def get_health(request: Request):
+    """Return a fixed, bounded health snapshot to an actual loopback peer."""
+    client_ip = request.client.host if request.client else ""
+    if not is_loopback_peer(client_ip):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    try:
+        snapshot = build_health_snapshot(store, registry, migration_leases)
+    except Exception:
+        snapshot = degraded_health_snapshot()
+    return JSONResponse(snapshot, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/settings")

@@ -432,10 +432,55 @@ owner glue, scheduler epoch checks, residue policy) is **not implemented**.
   constructor/callable/epoch/reading injection surface; hermetic tests patch
   the module's private helpers only.
 
+## Local evidence transport
+
+`autonomy/evidence_transport.py` is a small, stdlib-only boundary primitive;
+it does not send chat messages, use the network, or inspect live agentchattr
+state. The constrained executor packs only an explicit, non-empty list of
+regular files below its own source root. An authorized scribe verifies the
+received bytes and may unpack them below a new target root. An independent
+reviewer checks the same transported bytes and manifest rather than trusting
+either role's description.
+
+The library API is `pack(source_root, relative_paths) -> bytes`,
+`verify(bundle) -> EvidenceManifest`, and
+`unpack(bundle, absent_target_root) -> EvidenceManifest`. The matching CLI is:
+
+```
+python -m autonomy.evidence_transport pack --source-root V:\work\attempt result.json logs\gate.txt > evidence.jsonl
+python -m autonomy.evidence_transport verify evidence.jsonl
+python -m autonomy.evidence_transport unpack evidence.jsonl V:\review\received
+```
+
+Use a byte-preserving native stdout redirect (for example `cmd.exe` or
+PowerShell 7+) for `pack`; `verify` and `unpack` also accept `-` for stdin.
+Source and target roots must be absolute local paths. Transport paths use `/`
+separators and are recorded in the explicit order supplied.
+
+Schema v1 is canonical UTF-8-without-BOM JSONL with LF endings and strict
+Base64. Each chunk and file has a SHA-256, while the bundle hash binds the
+schema/version, chunk size, ordinal path list, per-file sizes, and per-file
+hashes. Parsing rejects duplicate JSON keys, unknown fields, wrong types,
+noncanonical bytes, missing/duplicate/reordered records, and trailing data.
+Fixed pre-materialization limits are 1 MiB per chunk, 32 files, 4096 chunks
+per file, 16 MiB per file, 32 MiB total payload, 512 UTF-8 bytes per relative
+path, and 96 MiB per encoded bundle.
+
+Paths fail closed on absolute/drive/UNC/device forms, empty or dot
+components, `..`, control or Windows-reserved punctuation (including
+`:`/ADS), reserved device names, trailing dot/space, case-fold collisions,
+and file/parent collisions. Packing and unpacking reject symlink/reparse
+ancestors and enforce real-path containment. `verify` has no filesystem side
+effects. `unpack` verifies the complete bounded bundle first, writes and
+flushes a unique sibling staging directory, then uses one native atomic
+no-replace rename to an absent target. Existing or race-created targets are
+never overwritten or removed, and failed staging is cleaned up.
+
 ## Tests
 
 ```
 python -m unittest tests.test_autonomy_queue -v
+python -m unittest tests.test_evidence_transport -v
 ```
 
 Hermetic (temp directories only, no network): module-form CLI contract and

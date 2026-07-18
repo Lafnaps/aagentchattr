@@ -88,6 +88,10 @@ _CHANNEL_NAME_RE = CHANNEL_NAME_RE  # backward-compatible private alias
 _channel_catalog_lock = CHANNEL_CATALOG_LOCK
 _catalogue_broadcast_pending: set[str] = set()
 _channel_outbound_lock = asyncio.Lock()
+# Serializes the Telegram owner-route find-or-create-and-wake critical section so
+# an authenticated retry (sequential, concurrent, or post-restart) resolves to
+# one durable owner message and one logical wake (L-CHATT 5-6 idempotency).
+_telegram_inbound_lock = threading.Lock()
 _structured_broadcast_suspended = 0
 _transaction_event_local = threading.local()
 _pending_transaction_events: dict[str, list[tuple]] = {}
@@ -2799,29 +2803,53 @@ async def api_telegram_inbound(request: Request):
         "correlation_id": correlation_id,
         "source": "telegram-owner",
     }
-    message, admission_error = store_channel_message(
-        telegram_route.OWNER_IDENTITY, text, channel=channel, metadata=metadata,
-    )
-    if admission_error:
-        status = 409 if "catalogue is full" in admission_error else 400
-        return JSONResponse({"error": admission_error}, status_code=status)
 
-    # Durable wake of the canonical responder via the existing per-agent queue.
-    # The wake carries no body; the action_id makes producer retries idempotent
-    # and the queue file survives offline + restart, so the responder injects
-    # exactly once whenever it next runs.
-    action_id = telegram_route.stable_inbound_action_id(
-        correlation_id, message["uid"]
-    )
-    try:
-        if agents is not None:
-            agents.trigger_sync(
-                recipient, message="", channel=channel, action_id=action_id,
+    # Idempotent find-or-create + wake, serialized so sequential/concurrent
+    # retries and a post-restart retry all resolve to ONE durable owner message
+    # and ONE logical wake.  The critical section runs entirely synchronously
+    # (no await), so holding a threading lock here cannot stall the event loop.
+    with _telegram_inbound_lock:
+        existing = None
+        if store is not None:
+            existing = telegram_route.find_persisted_inbound(
+                store.get_since(-1, channel=channel), correlation_id
             )
-    except DeliveryBackpressureError:
-        return JSONResponse(
-            {"error": "route delivery temporarily unavailable"}, status_code=503,
+        if existing is not None:
+            # A retry of the same logical request.  Reuse the one persisted
+            # message (so no new uid, hence a stable wake action_id) — unless
+            # the correlation id was reused for a DIFFERENT envelope, which is
+            # a conflict we fail closed generically before any second effect.
+            if not telegram_route.inbound_envelope_matches(existing, recipient, text):
+                return JSONResponse({"error": "conflict"}, status_code=409)
+            message = existing
+        else:
+            message, admission_error = store_channel_message(
+                telegram_route.OWNER_IDENTITY, text, channel=channel,
+                metadata=metadata,
+            )
+            if admission_error:
+                status = 409 if "catalogue is full" in admission_error else 400
+                return JSONResponse({"error": admission_error}, status_code=status)
+
+        # Durable wake of the canonical responder via the existing per-agent
+        # queue.  The wake carries no body; the action_id is stable for the
+        # logical request (correlation id + the reused message uid), so the
+        # AgentTrigger/journal dedup collapses retries to one wake — and a retry
+        # after the message persisted but the queue append hit backpressure
+        # re-attaches to the same message and safely re-attempts the same wake.
+        action_id = telegram_route.stable_inbound_action_id(
+            correlation_id, message["uid"]
         )
+        try:
+            if agents is not None:
+                agents.trigger_sync(
+                    recipient, message="", channel=channel, action_id=action_id,
+                )
+        except DeliveryBackpressureError:
+            return JSONResponse(
+                {"error": "route delivery temporarily unavailable"},
+                status_code=503,
+            )
     return JSONResponse({
         "status": "queued",
         "recipient": recipient,
@@ -2832,50 +2860,74 @@ async def api_telegram_inbound(request: Request):
 
 
 @app.get("/api/telegram/outbound")
-async def api_telegram_outbound(request: Request, since_id: int = 0,
-                                limit: int = 50):
+async def api_telegram_outbound(request: Request):
     """Bounded loopback egress for the Telegram owner bridge (L-CHATT 5-6).
 
     Route-bearer gated (single factor: the bridge polling its own reply feed).
-    Returns #owner-telegram messages explicitly addressed to `owner-telegram`,
-    preserving canonical recipient, correlation id and the monotonic message-id
-    cursor, and EXCLUDING the echo-loop source (messages whose sender is
-    `owner-telegram`).  A wrong/missing bearer rejects with a generic 403.
+    Returns #owner-telegram responses bound for `owner-telegram` — an ordinary
+    canonical `codex-sol` reply as well as explicitly addressed ones — while
+    EXCLUDING the echo-loop source (owner-authored inbound) and unrelated/
+    explicit-foreign traffic.  Canonical sender, owner recipient, correlation id
+    and the monotonic message-id cursor are preserved.
+
+    Paging is lossless: candidates are scanned in ascending id order and at most
+    `limit` responses are collected; `cursor` is set to the id of the last
+    SCANNED (covered) message, so the next `?since_id=<cursor>` poll resumes
+    exactly at the coverage boundary with no rescan, skip or reorder.  A fresh
+    `since_id=0` poll starts at the beginning of the dedicated channel (which is
+    created for the route, so it has no pre-route backlog) and pages forward from
+    there.  Correlation is derived deterministically from explicit metadata/reply
+    when present, otherwise (bounded sequential MVP) from the most recent
+    preceding owner request in the channel.  A wrong/missing bearer rejects with
+    a generic 403.
     """
     guard = telegram_route_guard
     bearer = _telegram_bearer(request)
     if guard is None or not guard.verify_bearer(bearer):
         return JSONResponse({"error": "forbidden"}, status_code=403)
-    if store is None:
-        return JSONResponse({"messages": [], "cursor": since_id})
+    # Validate paging params AFTER the bearer gate so an unauthenticated caller
+    # cannot probe the endpoint (or echo its input back) via query-type errors.
     try:
-        limit = max(1, min(int(limit), 200))
-        since_id = max(0, int(since_id))
+        since_id = max(0, int(request.query_params.get("since_id", "0")))
+        limit = max(1, min(int(request.query_params.get("limit", "50")), 200))
     except (TypeError, ValueError):
         return JSONResponse({"error": "invalid cursor"}, status_code=400)
+    if store is None:
+        return JSONResponse({"messages": [], "cursor": since_id})
 
-    if since_id:
-        candidates = store.get_since(since_id, channel=telegram_route.ROUTE_CHANNEL)
-    else:
-        candidates = store.get_recent(limit, channel=telegram_route.ROUTE_CHANNEL)
+    # The whole dedicated channel (ascending) is needed to resolve an ordinary
+    # response's correlation from its preceding owner request even when that
+    # request precedes the poll window.  `since_id == 0` scans it from the start;
+    # `since_id > 0` resumes strictly after the last covered id.
+    channel = telegram_route.ROUTE_CHANNEL
+    full_channel = store.get_since(-1, channel=channel)
+    candidates = full_channel if since_id == 0 else [
+        m for m in full_channel if m["id"] > since_id
+    ]
 
     entries = []
+    last_scanned_id = None
     for message in candidates:
+        last_scanned_id = message["id"]
         # Echo-loop exclusion: never hand the owner's own inbound back to them.
         if message.get("sender") == telegram_route.OWNER_IDENTITY:
             continue
-        if not telegram_route.is_addressed_to_owner(message, store.get_by_id):
+        if not telegram_route.is_route_response(message, store.get_by_id):
             continue
+        preceding = telegram_route.preceding_owner_request(
+            full_channel, message["id"]
+        )
         correlation_id = telegram_route.resolve_correlation(
-            message, store.get_by_id
+            message, store.get_by_id, preceding_request=preceding
         )
         entries.append(telegram_route.outbound_entry(message, correlation_id))
+        if len(entries) >= limit:
+            break
 
-    entries = entries[-limit:]
-    # Advance the monotonic cursor past every scanned message (message ids are
-    # monotonic), so the bridge never re-scans echo/unaddressed traffic; stays
-    # at since_id when nothing new was scanned.
-    cursor = candidates[-1]["id"] if candidates else since_id
+    # Cursor = id of the last SCANNED (hence covered) message, so filtered/echo
+    # records are not rescanned and no addressed reply beyond `limit` is skipped;
+    # it stays at since_id when nothing new was scanned.
+    cursor = last_scanned_id if last_scanned_id is not None else since_id
     return JSONResponse({"messages": entries, "cursor": cursor})
 
 

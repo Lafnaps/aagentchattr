@@ -13,9 +13,16 @@ The two endpoints reuse the accepted store/routing/delivery machinery; they are
 NOT a parallel message system.  The bridge must use ONLY these paths:
 
 * ``POST /api/telegram/inbound``  — deliver an owner Telegram message to the
-  canonical responder ``codex-sol`` (two-factor gated).
-* ``GET  /api/telegram/outbound`` — poll ``codex-sol``'s replies addressed to
-  ``owner-telegram`` (route-bearer gated, echo-excluded).
+  canonical responder ``codex-sol`` (two-factor gated).  Idempotent on
+  ``correlation_id``: an authenticated retry (sequential, concurrent, after a
+  lost 200 or a delivery-backpressure 503, or after a restart) resolves to the
+  one durable owner message, the same receipt ``cursor`` and one logical wake;
+  reusing a ``correlation_id`` for a different envelope fails closed generically.
+* ``GET  /api/telegram/outbound`` — poll ``codex-sol``'s replies bound for
+  ``owner-telegram`` (route-bearer gated, echo-excluded).  An ORDINARY canonical
+  ``codex-sol`` reply is delivered without any fabricated recipient/reply/
+  metadata; paging is lossless (ascending scan, at most ``limit`` per page,
+  ``cursor`` = last covered id — no skip/reorder/duplicate).
 
 NOTE: :func:`build_contract_harness` mutates the process-wide ``app`` singleton
 (there is one server per process).  Always call :meth:`RouteContractHarness.close`
@@ -92,7 +99,9 @@ def example_outbound_response(*, messages: list[dict] | None = None,
     Each entry preserves the monotonic ``id`` cursor, the canonical
     ``recipient`` (``owner-telegram``), the ``correlation_id`` linking the reply
     to its inbound question, plus ``sender``/``text``/``channel``.  The bridge
-    resumes from ``cursor`` via ``?since_id=<cursor>``.
+    resumes from ``cursor`` via ``?since_id=<cursor>``; ``cursor`` is the id of
+    the last message COVERED by this page (scanned, whether or not selected), so
+    forward polling never rescans, skips or reorders a reply.
     """
     return {"messages": messages or [], "cursor": cursor}
 

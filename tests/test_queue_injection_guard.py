@@ -636,6 +636,35 @@ class InjectAttemptTests(unittest.TestCase):
         self.assertTrue(all(event["max_retry_seconds"] == 60.0
                             for event in watchdogs))
 
+    def test_cancelled_episode_can_recover_for_active_codex_owner_wake(self):
+        guard = wrapper_windows._ComposerAdmissionGuard("codex")
+        now = [0.0]
+        injector = wrapper_windows._make_admitted_injector(
+            composer_guard=guard,
+            monotonic=lambda: now[0],
+        )
+        cancelled = {
+            "status": "cancelled",
+            "event": {
+                "action": "injection-enter-cancelled",
+                "fingerprint": "cancelled-owner-wake",
+            },
+        }
+        with mock.patch.object(
+            wrapper_windows, "_injection_attempt",
+            side_effect=[cancelled, {"status": "injected"}],
+        ) as attempt, mock.patch.object(
+            wrapper_windows, "_read_visible_console_text",
+            return_value=CODEX_IDLE.replace("2m 10s", "9m 01s"),
+        ):
+            self.assertEqual(injector.inject_active("owner one"), "cancelled")
+            now[0] = 2.0
+            self.assertTrue(injector.recovery_probe_active())
+            self.assertEqual(injector.inject_active("owner two"), "injected")
+
+        self.assertEqual(attempt.call_count, 2)
+        self.assertTrue(attempt.call_args.kwargs["allow_active"])
+
 
 class OwnerInterruptDispatchTests(unittest.TestCase):
     def test_bounded_inject_uses_active_hook_for_owner_interrupt(self):
@@ -1140,6 +1169,40 @@ class WatcherDurabilityTests(unittest.TestCase):
                 return False
 
         injector = RecoveringInjector()
+        with mock.patch.object(
+            wrapper, "_read_delivery_indexes"
+        ) as read_journal, mock.patch.object(
+            wrapper, "_append_delivery_transition"
+        ) as append_journal:
+            self._run_watcher(injector, observed)
+        read_journal.assert_not_called()
+        append_journal.assert_not_called()
+        self.assertEqual(self.queue.read_bytes(), payload)
+        self.assertEqual(self._cursor_offset(), 0)
+
+    def test_owner_event_uses_active_recovery_probe_before_journal(self):
+        payload = b'{"channel": "owner-telegram"}\n'
+        self.queue.write_bytes(payload)
+        observed = threading.Event()
+
+        class RecoveringOwnerInjector:
+            def __call__(self, _prompt):
+                raise AssertionError("regular injector must not run")
+
+            def retry_after(self):
+                return 0.0
+
+            def recovery_probe(self):
+                raise AssertionError("regular recovery probe must not run")
+
+            def recovery_probe_active(self):
+                observed.set()
+                return False
+
+            def inject_active(self, _prompt):
+                raise AssertionError("must not inject before active recovery")
+
+        injector = RecoveringOwnerInjector()
         with mock.patch.object(
             wrapper, "_read_delivery_indexes"
         ) as read_journal, mock.patch.object(

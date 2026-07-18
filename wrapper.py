@@ -1404,9 +1404,14 @@ def _inject_retry_after(inject_fn) -> float:
     return value
 
 
-def _inject_recovery_ready(inject_fn) -> bool:
+def _inject_recovery_ready(inject_fn, *, allow_active: bool = False) -> bool:
     """Run the optional read-only recovery probe before journal admission."""
-    hook = getattr(inject_fn, "recovery_probe", None)
+    hook = (
+        getattr(inject_fn, "recovery_probe_active", None)
+        if allow_active else None
+    )
+    if not callable(hook):
+        hook = getattr(inject_fn, "recovery_probe", None)
     if not callable(hook):
         return True
     ready = hook()
@@ -1538,6 +1543,10 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                         f"bytes); manual replay required.", flush=True,
                     )
             elif triggers:
+                allow_active = any(
+                    event.get("channel") == "owner-telegram"
+                    for event in triggers
+                )
                 # A cancelled/error episode owns its own monotonic backoff.
                 # Respect it before preparing/reading/appending the delivery
                 # journal.  When due, the optional hook performs only a
@@ -1547,7 +1556,9 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                 retry_after = _inject_retry_after(inject_fn)
                 if retry_after > 0.0:
                     raise _WatcherDefer(retry_after)
-                if not _inject_recovery_ready(inject_fn):
+                if not _inject_recovery_ready(
+                    inject_fn, allow_active=allow_active
+                ):
                     raise _WatcherDefer(_inject_retry_after(inject_fn))
 
                 all_events = _prepare_delivery_events(
@@ -1687,10 +1698,7 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                 result = _call_inject_bounded(
                     inject_fn, prompt.replace("\n", " "),
                     inject_timeout_seconds,
-                    allow_active=any(
-                        event.get("channel") == "owner-telegram"
-                        for event in events
-                    ),
+                    allow_active=allow_active,
                 )
                 terminal_state = _terminal_delivery_state(result)
                 if terminal_state is not None:

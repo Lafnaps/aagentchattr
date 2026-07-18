@@ -328,7 +328,8 @@ def _injection_attempt(text: str, *, delay: float = 0.3,
 
 
 def _probe_injection_admission(*, safeguard_guard: bool,
-                               composer_guard) -> dict:
+                               composer_guard,
+                               allow_active: bool = False) -> dict:
     """Read-only recovery probe; never sends text or Enter.
 
     The same fail-closed ordering as _injection_attempt is used, but a
@@ -358,7 +359,10 @@ def _probe_injection_admission(*, safeguard_guard: bool,
             # unknown composer is empty.
             classification = "unrecognized-composer"
         else:
-            classification = composer_guard.classify(screen)
+            classification = (
+                composer_guard.classify_active(screen)
+                if allow_active else composer_guard.classify(screen)
+            )
     return {
         "ready": classification == "admit",
         "classification": classification,
@@ -447,7 +451,7 @@ def _make_admitted_injector(*, delay: float = 0.3,
                 "max_retry_seconds": probe_max,
             })
 
-    def _recovery_probe() -> bool:
+    def _recovery_probe_mode(*, allow_active: bool = False) -> bool:
         """Return True only after a due, read-only stable-empty probe."""
         if not blocked_episode:
             return True
@@ -457,6 +461,7 @@ def _make_admitted_injector(*, delay: float = 0.3,
         result = _probe_injection_admission(
             safeguard_guard=safeguard_guard,
             composer_guard=composer_guard,
+            allow_active=allow_active,
         )
         if result["ready"]:
             _reset_blocked_episode()
@@ -464,12 +469,27 @@ def _make_admitted_injector(*, delay: float = 0.3,
         _schedule_probe(clock())
         return False
 
+    def _recovery_probe() -> bool:
+        return _recovery_probe_mode()
+
+    def _recovery_probe_active() -> bool:
+        # Owner Telegram delivery may interrupt an active Codex turn. Recovery
+        # must use the same empty-composer admission mode as that delivery;
+        # otherwise one cancelled attempt blocks every later owner wake until
+        # the turn ends.
+        if composer_guard is None or composer_guard.provider != "codex":
+            return _recovery_probe_mode()
+        return _recovery_probe_mode(allow_active=True)
+
     def _run_mode(text: str, *, allow_active: bool = False) -> str:
         # Direct callers are protected too.  The queue watcher normally calls
         # retry_after()/recovery_probe() before beginning its journal
         # transaction; this fallback preserves the same no-retype invariant.
         if blocked_episode:
-            if _retry_after() > 0.0 or not _recovery_probe():
+            recovery_probe = (
+                _recovery_probe_active if allow_active else _recovery_probe
+            )
+            if _retry_after() > 0.0 or not recovery_probe():
                 return "deferred"
 
         result = _injection_attempt(
@@ -525,6 +545,7 @@ def _make_admitted_injector(*, delay: float = 0.3,
     # and legacy injectors.
     _run.retry_after = _retry_after
     _run.recovery_probe = _recovery_probe
+    _run.recovery_probe_active = _recovery_probe_active
     _run.inject_active = _run_active
     return _run
 

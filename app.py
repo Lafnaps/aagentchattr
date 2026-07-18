@@ -41,6 +41,8 @@ from channel_policy import (
     bounded_discovery_limit,
     channel_name_error,
 )
+from delivery_io import DeliveryBackpressureError
+import telegram_route
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +60,8 @@ registry: RuntimeRegistry | None = None
 migration_leases: MigrationLeaseStore | None = None
 session_store: SessionStore | None = None
 session_engine: SessionEngine | None = None
+# Two-factor gate for the Telegram owner route (L-CHATT 5-6); set by configure().
+telegram_route_guard: "telegram_route.TelegramRouteGuard | None" = None
 config: dict = {}
 ws_clients: set[WebSocket] = set()
 
@@ -916,6 +920,19 @@ def _install_security_middleware(token: str, cfg: dict):
                     )
                 return await call_next(request)
 
+            # Telegram owner bridge: loopback only. The endpoint enforces its
+            # own two-factor (route bearer + Telegram allowlist) gate; the
+            # middleware only restricts transport to local loopback so a remote
+            # caller can never reach the privileged wake path. No route/registry
+            # detail is disclosed here.
+            if path.startswith("/api/telegram/"):
+                client_ip = request.client.host if request.client else ""
+                if client_ip not in ("127.0.0.1", "::1", "localhost"):
+                    return JSONResponse(
+                        {"error": "forbidden"}, status_code=403,
+                    )
+                return await call_next(request)
+
             # --- Origin check (blocks cross-origin / DNS-rebinding attacks) ---
             origin = request.headers.get("origin")
             if origin and origin not in allowed_origins:
@@ -960,13 +977,19 @@ def _install_security_middleware(token: str, cfg: dict):
 
 
 def configure(cfg: dict, session_token: str = ""):
-    global store, rules, summaries, jobs, schedules, router, agents, registry, migration_leases, session_store, session_engine, config
+    global store, rules, summaries, jobs, schedules, router, agents, registry, migration_leases, session_store, session_engine, telegram_route_guard, config
     config = cfg
     # --- Security: store the session token and install middleware ---
     _install_security_middleware(session_token, cfg)
 
     data_dir = cfg.get("server", {}).get("data_dir", "./data")
     Path(data_dir).mkdir(parents=True, exist_ok=True)
+    # Two-factor gate for the Telegram owner route.  Loads any existing
+    # provisioned bearer digest + allowlist; stays fail-closed (rejecting every
+    # request) until an owner-side setup provisions it.
+    telegram_route_guard = telegram_route.TelegramRouteGuard(
+        str(Path(data_dir) / "telegram_route.json")
+    )
     # Load the strict lease store before any registry/background cleanup.  A
     # corrupt or torn store remains attached in an unhealthy fail-closed state,
     # freezing topology until an operator repairs it.
@@ -2712,6 +2735,148 @@ async def api_send(request: Request):
         status = 409 if "catalogue is full" in admission_error else 400
         return JSONResponse({"error": admission_error}, status_code=status)
     return JSONResponse(msg)
+
+
+def _telegram_bearer(request: Request) -> str:
+    """Extract the presented bearer without ever logging or echoing it."""
+    auth = request.headers.get("authorization", "")
+    return auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+
+
+@app.post("/api/telegram/inbound")
+async def api_telegram_inbound(request: Request):
+    """Bounded loopback ingress for the Telegram owner bridge (L-CHATT 5-6).
+
+    Two-factor gate: the request must present BOTH the route's own bearer AND a
+    Telegram (user_id, chat_id) pair in the configured allowlist.  Either factor
+    missing or wrong rejects with a generic 403 BEFORE any persistence or wake,
+    and discloses no route/registry detail.  On success the owner message is
+    persisted to the #owner-telegram channel with its correlation id, and the
+    canonical responder `codex-sol` is durably woken exactly once — the wake
+    survives the responder being offline and survives a server restart, and it
+    carries no message body (the responder reads #owner-telegram itself).
+
+    Wire request (JSON): {text, correlation_id, telegram_user_id,
+    telegram_chat_id, recipient?, channel?}.  Wire response: {status,
+    recipient, channel, correlation_id, cursor}.  Raw bearer, user/chat ids and
+    message bodies never enter logs, errors, metrics or response diagnostics.
+    """
+    guard = telegram_route_guard
+    bearer = _telegram_bearer(request)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid request"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid request"}, status_code=400)
+
+    user_id = telegram_route.normalize_tg_id(body.get("telegram_user_id"))
+    chat_id = telegram_route.normalize_tg_id(body.get("telegram_chat_id"))
+
+    # Two-factor gate FIRST: reject before validating or persisting anything so
+    # a rejected caller cannot probe recipient/channel validity or cause a wake.
+    if guard is None or not guard.verify_inbound(bearer, user_id, chat_id):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    # Authenticated. Validate the envelope.
+    recipient = telegram_route.canonicalize_recipient(body.get("recipient"))
+    if recipient is None:
+        return JSONResponse({"error": "invalid recipient"}, status_code=400)
+    channel = telegram_route.normalize_route_channel(body.get("channel"))
+    if channel is None:
+        return JSONResponse({"error": "invalid channel"}, status_code=400)
+    correlation_id = body.get("correlation_id")
+    if not isinstance(correlation_id, str) or not correlation_id.strip():
+        return JSONResponse({"error": "correlation_id is required"}, status_code=400)
+    correlation_id = correlation_id.strip()
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return JSONResponse({"error": "text is required"}, status_code=400)
+    text = text.strip()
+
+    metadata = {
+        "recipient": recipient,
+        "correlation_id": correlation_id,
+        "source": "telegram-owner",
+    }
+    message, admission_error = store_channel_message(
+        telegram_route.OWNER_IDENTITY, text, channel=channel, metadata=metadata,
+    )
+    if admission_error:
+        status = 409 if "catalogue is full" in admission_error else 400
+        return JSONResponse({"error": admission_error}, status_code=status)
+
+    # Durable wake of the canonical responder via the existing per-agent queue.
+    # The wake carries no body; the action_id makes producer retries idempotent
+    # and the queue file survives offline + restart, so the responder injects
+    # exactly once whenever it next runs.
+    action_id = telegram_route.stable_inbound_action_id(
+        correlation_id, message["uid"]
+    )
+    try:
+        if agents is not None:
+            agents.trigger_sync(
+                recipient, message="", channel=channel, action_id=action_id,
+            )
+    except DeliveryBackpressureError:
+        return JSONResponse(
+            {"error": "route delivery temporarily unavailable"}, status_code=503,
+        )
+    return JSONResponse({
+        "status": "queued",
+        "recipient": recipient,
+        "channel": channel,
+        "correlation_id": correlation_id,
+        "cursor": message["id"],
+    })
+
+
+@app.get("/api/telegram/outbound")
+async def api_telegram_outbound(request: Request, since_id: int = 0,
+                                limit: int = 50):
+    """Bounded loopback egress for the Telegram owner bridge (L-CHATT 5-6).
+
+    Route-bearer gated (single factor: the bridge polling its own reply feed).
+    Returns #owner-telegram messages explicitly addressed to `owner-telegram`,
+    preserving canonical recipient, correlation id and the monotonic message-id
+    cursor, and EXCLUDING the echo-loop source (messages whose sender is
+    `owner-telegram`).  A wrong/missing bearer rejects with a generic 403.
+    """
+    guard = telegram_route_guard
+    bearer = _telegram_bearer(request)
+    if guard is None or not guard.verify_bearer(bearer):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    if store is None:
+        return JSONResponse({"messages": [], "cursor": since_id})
+    try:
+        limit = max(1, min(int(limit), 200))
+        since_id = max(0, int(since_id))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "invalid cursor"}, status_code=400)
+
+    if since_id:
+        candidates = store.get_since(since_id, channel=telegram_route.ROUTE_CHANNEL)
+    else:
+        candidates = store.get_recent(limit, channel=telegram_route.ROUTE_CHANNEL)
+
+    entries = []
+    for message in candidates:
+        # Echo-loop exclusion: never hand the owner's own inbound back to them.
+        if message.get("sender") == telegram_route.OWNER_IDENTITY:
+            continue
+        if not telegram_route.is_addressed_to_owner(message, store.get_by_id):
+            continue
+        correlation_id = telegram_route.resolve_correlation(
+            message, store.get_by_id
+        )
+        entries.append(telegram_route.outbound_entry(message, correlation_id))
+
+    entries = entries[-limit:]
+    # Advance the monotonic cursor past every scanned message (message ids are
+    # monotonic), so the bridge never re-scans echo/unaddressed traffic; stays
+    # at since_id when nothing new was scanned.
+    cursor = candidates[-1]["id"] if candidates else since_id
+    return JSONResponse({"messages": entries, "cursor": cursor})
 
 
 @app.post("/api/rotate-token/{name}")

@@ -1,0 +1,341 @@
+"""Telegram owner-route: canonical ``codex-sol`` responder + two-factor wake gate.
+
+L-CHATT items 5-6 of the owner-approved ``ORCH-MON-TELEGRAM-R1`` plan.  This
+module adds ONLY the missing approved route/security contract on top of the
+accepted agentchattr store, routing and delivery machinery — it is not a
+parallel message system.  Messages still live in the one :class:`MessageStore`
+and wakes still use the one per-agent delivery queue.
+
+Contract enforced here:
+
+* **Canonical durable route.**  Telegram-owner messages are delivered to the
+  canonical responder ``codex-sol``.  The public compatibility alias ``@codex``
+  resolves to ``codex-sol`` — never the reverse — and no status, receipt or
+  runtime identity is ever renamed to the legacy ``codex`` name.
+* **Two-factor privileged wake.**  The ``owner-telegram`` service identity may
+  take the privileged wake path only when BOTH the Telegram user/chat pair is
+  in the configured allowlist AND the request presents the route's own bearer.
+  Either factor missing or wrong is rejected before any persistence or wake.
+* **Secret-safety.**  The raw route bearer is never stored or logged; only a
+  salted HMAC-SHA256 digest is persisted.  Bearers, message bodies, Telegram
+  user/chat ids and correlation ids never enter logs, metrics, audit metadata
+  or error/response diagnostics.  This module intentionally does no logging.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import tempfile
+import threading
+from pathlib import Path
+
+
+# --- Canonical route identities (never the legacy ``codex`` name) ------------
+
+#: The canonical durable responder for Telegram-owner messages.
+CANONICAL_RESPONDER = "codex-sol"
+
+#: The service identity that authors inbound owner messages and is the
+#: recipient of outbound replies.  Not a human/browser alias.
+OWNER_IDENTITY = "owner-telegram"
+
+#: The dedicated channel (displayed ``#owner-telegram``) that carries the
+#: Telegram-owner conversation in the shared message store.
+ROUTE_CHANNEL = "owner-telegram"
+
+#: Public compatibility recipient tokens that RESOLVE to the canonical
+#: responder.  The legacy ``codex`` is accepted as an inbound *address* only;
+#: it is never emitted as an identity, receipt or status.
+_RECIPIENT_ALIASES = {
+    "codex-sol": CANONICAL_RESPONDER,
+    "codex": CANONICAL_RESPONDER,
+}
+
+
+def canonicalize_recipient(value: object) -> str | None:
+    """Resolve a recipient token to the canonical responder, or ``None``.
+
+    ``None``/empty defaults to the canonical responder.  ``@codex`` / ``codex``
+    are accepted compatibility aliases that resolve to ``codex-sol``.  The
+    mapping is one-way: it can only ever yield ``codex-sol``, so a caller can
+    never coerce a message onto the legacy ``codex`` identity.  Unknown tokens
+    return ``None`` (an invalid recipient the caller must refuse).
+    """
+    if value is None:
+        return CANONICAL_RESPONDER
+    if not isinstance(value, str):
+        return None
+    token = value.strip().lstrip("@").lower()
+    if not token:
+        return CANONICAL_RESPONDER
+    return _RECIPIENT_ALIASES.get(token)
+
+
+def normalize_route_channel(value: object) -> str | None:
+    """Normalize ``#owner-telegram``/``owner-telegram`` to the route channel.
+
+    ``None``/empty defaults to the route channel.  A leading ``#`` is accepted
+    and stripped.  Any other channel is invalid and returns ``None``: the route
+    endpoint refuses to admit owner traffic into an unexpected channel.
+    """
+    if value is None:
+        return ROUTE_CHANNEL
+    if not isinstance(value, str):
+        return None
+    token = value.strip().lstrip("#").lower()
+    if not token:
+        return ROUTE_CHANNEL
+    return ROUTE_CHANNEL if token == ROUTE_CHANNEL else None
+
+
+def normalize_tg_id(value: object) -> str:
+    """Normalize a Telegram numeric id to a comparison string ("" if absent)."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        # bool is an int subclass; a boolean id is never a valid Telegram id.
+        return ""
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+def stable_inbound_action_id(correlation_id: str, uid: str) -> str:
+    """Generation-independent idempotency key for the durable inbound wake.
+
+    Derived only from the correlation id and the persisted message uid so a
+    producer retry deduplicates regardless of whether ``codex-sol`` is
+    registered yet.  It matches the ``act-<sha256>`` shape consumed by the
+    delivery journal.
+    """
+    canonical = (
+        "telegram-inbound\x00" + str(correlation_id) + "\x00" + str(uid)
+    ).encode("utf-8")
+    return "act-" + hashlib.sha256(canonical).hexdigest()
+
+
+# --- Outbound addressing / correlation helpers -------------------------------
+
+
+def is_addressed_to_owner(message: dict, resolve_reply) -> bool:
+    """Whether an outbound message is explicitly addressed to ``owner-telegram``.
+
+    True when the message carries ``recipient == owner-telegram`` metadata, or
+    it ``@owner-telegram``-mentions the owner, or it replies to a message
+    authored by the owner.  ``resolve_reply(msg_id)`` returns the parent
+    message dict (or ``None``).  Echo-loop exclusion (dropping messages whose
+    sender is the owner) is applied by the caller before this check.
+    """
+    metadata = message.get("metadata") or {}
+    if metadata.get("recipient") == OWNER_IDENTITY:
+        return True
+    text = message.get("text")
+    if isinstance(text, str) and ("@" + OWNER_IDENTITY) in text.lower():
+        return True
+    reply_id = message.get("reply_to")
+    if reply_id is not None:
+        parent = resolve_reply(reply_id)
+        if parent and parent.get("sender") == OWNER_IDENTITY:
+            return True
+    return False
+
+
+def resolve_correlation(message: dict, resolve_reply) -> str | None:
+    """Return the correlation id preserved on a message or inherited from its
+    replied-to owner message; ``None`` if neither carries one."""
+    metadata = message.get("metadata") or {}
+    cid = metadata.get("correlation_id")
+    if isinstance(cid, str) and cid:
+        return cid
+    reply_id = message.get("reply_to")
+    if reply_id is not None:
+        parent = resolve_reply(reply_id)
+        if parent:
+            parent_meta = parent.get("metadata") or {}
+            parent_cid = parent_meta.get("correlation_id")
+            if isinstance(parent_cid, str) and parent_cid:
+                return parent_cid
+    return None
+
+
+def outbound_entry(message: dict, correlation_id: str | None) -> dict:
+    """Build the bounded outbound wire entry for the bridge.
+
+    Explicitly carries the monotonic message-id cursor, the canonical
+    recipient, the preserved correlation id, sender, channel and text.
+    """
+    return {
+        "id": message.get("id"),
+        "sender": message.get("sender"),
+        "recipient": OWNER_IDENTITY,
+        "correlation_id": correlation_id,
+        "text": message.get("text", ""),
+        "channel": message.get("channel", ROUTE_CHANNEL),
+    }
+
+
+# --- Two-factor route guard (bearer digest + Telegram allowlist) -------------
+
+_STORE_VERSION = 1
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Durably replace a file without exposing a truncated destination."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix="." + path.name + ".", suffix=".tmp",
+                                    dir=str(path.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def _digest(salt_hex: str, bearer: str) -> str:
+    """Salted HMAC-SHA256 of a bearer.  The raw bearer never leaves memory."""
+    return hmac.new(
+        bytes.fromhex(salt_hex), bearer.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+
+
+def _allowlist_key(user_id: object, chat_id: object) -> tuple[str, str]:
+    return (normalize_tg_id(user_id), normalize_tg_id(chat_id))
+
+
+class TelegramRouteGuard:
+    """Persistent two-factor gate for the ``owner-telegram`` privileged wake.
+
+    The store on disk holds only a bearer *salt+digest* (never the raw bearer)
+    and the Telegram (user_id, chat_id) allowlist.  Provisioning is a local,
+    owner-side setup action; no secret is baked into code.
+    """
+
+    def __init__(self, path: str | os.PathLike):
+        self._path = Path(path)
+        self._lock = threading.Lock()
+        self._salt: str | None = None
+        self._bearer_hash: str | None = None
+        self._allowlist: set[tuple[str, str]] = set()
+        self._load()
+
+    # --- persistence ---
+
+    def _load(self) -> None:
+        if not self._path.exists():
+            return
+        try:
+            data = json.loads(self._path.read_text("utf-8"))
+        except Exception:
+            # A corrupt store fails closed: the guard stays un-provisioned and
+            # every request is rejected until an operator repairs it.
+            return
+        if not isinstance(data, dict):
+            return
+        salt = data.get("bearer_salt")
+        digest = data.get("bearer_hash")
+        allowlist = data.get("allowlist")
+        if isinstance(salt, str) and isinstance(digest, str):
+            self._salt = salt
+            self._bearer_hash = digest
+        if isinstance(allowlist, list):
+            self._allowlist = {
+                _allowlist_key(entry.get("user_id"), entry.get("chat_id"))
+                for entry in allowlist
+                if isinstance(entry, dict)
+            }
+            self._allowlist.discard(("", ""))
+
+    def _snapshot(self) -> dict:
+        return {
+            "version": _STORE_VERSION,
+            "bearer_salt": self._salt,
+            "bearer_hash": self._bearer_hash,
+            "allowlist": [
+                {"user_id": user_id, "chat_id": chat_id}
+                for (user_id, chat_id) in sorted(self._allowlist)
+            ],
+        }
+
+    # --- provisioning (owner setup) ---
+
+    def provision(self, bearer: str, allowlist) -> None:
+        """Provision (or re-provision) the route bearer and Telegram allowlist.
+
+        ``bearer`` is supplied by the owner/setup and shared with the bridge;
+        only its salted digest is persisted.  ``allowlist`` is an iterable of
+        ``(user_id, chat_id)`` pairs or ``{"user_id","chat_id"}`` dicts.  A
+        fresh random salt is minted on every provision.  The raw bearer is not
+        returned, logged or stored.
+        """
+        if not isinstance(bearer, str) or not bearer.strip():
+            raise ValueError("route bearer must be a non-empty string")
+        normalized: set[tuple[str, str]] = set()
+        for entry in allowlist or ():
+            if isinstance(entry, dict):
+                key = _allowlist_key(entry.get("user_id"), entry.get("chat_id"))
+            else:
+                user_id, chat_id = entry
+                key = _allowlist_key(user_id, chat_id)
+            if key != ("", ""):
+                normalized.add(key)
+        if not normalized:
+            raise ValueError("route allowlist must contain at least one pair")
+        salt = secrets.token_hex(16)
+        with self._lock:
+            self._salt = salt
+            self._bearer_hash = _digest(salt, bearer)
+            self._allowlist = normalized
+            _atomic_write_bytes(
+                self._path,
+                json.dumps(self._snapshot(), ensure_ascii=True).encode("utf-8"),
+            )
+
+    def is_provisioned(self) -> bool:
+        with self._lock:
+            return bool(self._salt and self._bearer_hash and self._allowlist)
+
+    # --- verification ---
+
+    def _bearer_ok_locked(self, bearer: object) -> bool:
+        if not self._salt or not self._bearer_hash:
+            return False
+        if not isinstance(bearer, str) or not bearer:
+            return False
+        return hmac.compare_digest(_digest(self._salt, bearer), self._bearer_hash)
+
+    def verify_bearer(self, bearer: object) -> bool:
+        """Single-factor route-bearer check (used by the outbound read path)."""
+        with self._lock:
+            return self._bearer_ok_locked(bearer)
+
+    def verify_inbound(self, bearer: object, user_id: object,
+                       chat_id: object) -> bool:
+        """Two-factor gate: the route bearer AND an allowlisted user/chat pair.
+
+        Returns ``True`` only when BOTH factors pass.  Never discloses which
+        factor failed and never logs the bearer, user or chat.
+        """
+        with self._lock:
+            if not self._allowlist:
+                return False
+            bearer_ok = self._bearer_ok_locked(bearer)
+            pair_ok = _allowlist_key(user_id, chat_id) in self._allowlist
+            # Evaluate both factors, then AND them.  Both are constant-time /
+            # membership checks over non-secret-length inputs.
+            return bool(bearer_ok and pair_ok)

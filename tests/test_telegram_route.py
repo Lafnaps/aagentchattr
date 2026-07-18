@@ -18,9 +18,11 @@ Contract proven here:
   * zero bearer/body/user/chat/correlation leak into logs/errors/queue/store.
 """
 
+import concurrent.futures
 import io
 import json
 import logging
+import os
 import sys
 import tempfile
 import threading
@@ -36,6 +38,7 @@ import app
 import telegram_route
 import telegram_route_contract as contract
 import wrapper
+from delivery_io import DeliveryBackpressureError
 from store import MessageStore
 from agents import AgentTrigger
 
@@ -576,6 +579,302 @@ class RoutePrivacyTests(unittest.TestCase):
         # store, not a log/metric/audit) so the responder can read it.
         msg = app.store.get_recent(1, channel="owner-telegram")[0]
         self.assertEqual(msg["text"], secret_body)
+
+
+# --------------------------------------------------------------------------- #
+# C1 — authenticated inbound is idempotent (retry / concurrent / restart / 503)
+# --------------------------------------------------------------------------- #
+class InboundIdempotencyTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.data_dir = Path(self.tmp.name)
+        self.h = contract.build_contract_harness(
+            self.data_dir, bearer=BEARER, allowlist=ALLOWLIST
+        )
+        self.addCleanup(lambda: self.h.close())
+        self.client = self.h.client
+        self.queue = self.h.responder_queue_path()
+
+    def _post(self, client=None, **kwargs):
+        kwargs.setdefault("telegram_user_id", USER_ID)
+        kwargs.setdefault("telegram_chat_id", CHAT_ID)
+        return (client or self.client).post(
+            contract.INBOUND_PATH, headers=AUTH,
+            json=contract.example_inbound_request(**kwargs),
+        )
+
+    def _owner_messages(self):
+        return app.store.get_recent(50, channel="owner-telegram")
+
+    def _wake_records(self):
+        if not self.queue.exists():
+            return []
+        return [json.loads(line) for line
+                in self.queue.read_text("utf-8").splitlines() if line.strip()]
+
+    def test_same_request_twice_yields_one_message_and_one_wake(self):
+        r1 = self._post(correlation_id="dup-1", text="same body")
+        r2 = self._post(correlation_id="dup-1", text="same body")
+        self.assertEqual((r1.status_code, r2.status_code), (200, 200))
+        # One durable owner message; identical, stable receipt (same cursor).
+        self.assertEqual(len(self._owner_messages()), 1)
+        self.assertEqual(r1.json(), r2.json())
+        # One logical wake carrying one stable action_id.
+        recs = self._wake_records()
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(len({r.get("action_id") for r in recs}), 1)
+
+    def test_concurrent_same_request_yields_one_message_and_one_wake(self):
+        barrier = threading.Barrier(2)
+
+        def call():
+            barrier.wait(timeout=5)
+            return self._post(correlation_id="cc-1", text="concurrent body")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            results = [f.result() for f in
+                       [ex.submit(call), ex.submit(call)]]
+        self.assertTrue(all(r.status_code == 200 for r in results))
+        self.assertEqual({r.json()["cursor"] for r in results}, {0})
+        self.assertEqual(len(self._owner_messages()), 1)
+        self.assertEqual(len(self._wake_records()), 1)
+
+    def test_restart_then_retry_yields_one_message_and_one_wake(self):
+        r1 = self._post(correlation_id="rs-1", text="restart body")
+        self.assertEqual(r1.status_code, 200)
+        self.assertEqual(len(self._wake_records()), 1)
+        # Simulate a server restart: rebuild the app on the SAME data dir.
+        self.h.close()
+        self.h = contract.build_contract_harness(
+            self.data_dir, bearer=BEARER, allowlist=ALLOWLIST
+        )
+        self.client = self.h.client
+        r2 = self._post(correlation_id="rs-1", text="restart body")
+        self.assertEqual(r2.status_code, 200)
+        # Same durable message + stable receipt; the wake deduped (one record).
+        self.assertEqual(r1.json()["cursor"], r2.json()["cursor"])
+        self.assertEqual(len(self._owner_messages()), 1)
+        self.assertEqual(len(self._wake_records()), 1)
+
+    def test_backpressure_after_persist_then_retry_recovers(self):
+        real = app.agents.trigger_sync
+        state = {"n": 0}
+
+        def flaky(*a, **k):
+            state["n"] += 1
+            if state["n"] == 1:
+                raise DeliveryBackpressureError("injected after persistence")
+            return real(*a, **k)
+
+        with mock.patch.object(app.agents, "trigger_sync", side_effect=flaky):
+            r1 = self._post(correlation_id="bp-1", text="bp body")
+            self.assertEqual(r1.status_code, 503)
+            # The message persisted; NO wake was enqueued for the failed append.
+            self.assertEqual(len(self._owner_messages()), 1)
+            self.assertEqual(self._wake_records(), [])
+            # The natural bridge retry re-attaches to the same message and
+            # safely re-attempts the same logical wake.
+            r2 = self._post(correlation_id="bp-1", text="bp body")
+            self.assertEqual(r2.status_code, 200)
+        self.assertEqual(len(self._owner_messages()), 1)
+        self.assertEqual(len(self._wake_records()), 1)
+
+    def test_conflicting_envelope_same_correlation_fails_closed(self):
+        r1 = self._post(correlation_id="conf-1", text="first body")
+        self.assertEqual(r1.status_code, 200)
+        r2 = self._post(correlation_id="conf-1", text="DIFFERENT body")
+        self.assertEqual(r2.status_code, 409)
+        # Generic body only: no correlation / body / route disclosure.
+        self.assertEqual(r2.json(), {"error": "conflict"})
+        self.assertNotIn("conf-1", r2.text)
+        self.assertNotIn("DIFFERENT body", r2.text)
+        # No second persistence, no second wake.
+        self.assertEqual(len(self._owner_messages()), 1)
+        self.assertEqual(len(self._wake_records()), 1)
+
+
+# --------------------------------------------------------------------------- #
+# C2 — an ordinary canonical response is selected without fabricated metadata
+# --------------------------------------------------------------------------- #
+class OutboundOrdinaryResponseTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.data_dir = Path(self.tmp.name)
+        self.h = contract.build_contract_harness(
+            self.data_dir, bearer=BEARER, allowlist=ALLOWLIST
+        )
+        self.addCleanup(lambda: self.h.close())
+        self.client = self.h.client
+
+    def _inbound(self, correlation_id):
+        r = self.client.post(
+            contract.INBOUND_PATH, headers=AUTH,
+            json=contract.example_inbound_request(
+                correlation_id=correlation_id,
+                telegram_user_id=USER_ID, telegram_chat_id=CHAT_ID),
+        )
+        self.assertEqual(r.status_code, 200)
+        return r
+
+    def _outbound(self, since_id=0, limit=50):
+        return self.client.get(
+            f"{contract.OUTBOUND_PATH}?since_id={since_id}&limit={limit}",
+            headers=AUTH,
+        ).json()
+
+    def test_ordinary_reply_selected_without_fabricated_metadata(self):
+        self._inbound("tg-ord")                                        # id 0
+        # Exactly how an ordinary mcp chat_send stores a reply: no reply_to,
+        # no metadata, no @mention.
+        app.store.add("codex-sol", "plain answer", channel="owner-telegram")  # 1
+        entries = self._outbound()["messages"]
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(entry["sender"], "codex-sol")
+        self.assertEqual(entry["recipient"], "owner-telegram")
+        self.assertEqual(entry["text"], "plain answer")
+        # Correlation inherited from the preceding owner request.
+        self.assertEqual(entry["correlation_id"], "tg-ord")
+
+    def test_multiple_sequential_pairs_map_deterministically(self):
+        self._inbound("q1")                                            # id 0
+        app.store.add("codex-sol", "ans1", channel="owner-telegram")   # id 1
+        self._inbound("q2")                                            # id 2
+        app.store.add("codex-sol", "ans2", channel="owner-telegram")   # id 3
+        got = {e["text"]: e["correlation_id"]
+               for e in self._outbound()["messages"]}
+        self.assertEqual(got, {"ans1": "q1", "ans2": "q2"})
+
+    def test_explicit_reply_takes_precedence_over_sequential_rule(self):
+        self._inbound("e1")                                            # id 0
+        self._inbound("e2")                                            # id 1
+        # Reply explicitly to the FIRST question even though the second is the
+        # most recent preceding owner request.
+        app.store.add("codex-sol", "ans", channel="owner-telegram",
+                      reply_to=0)                                      # id 2
+        entry = next(e for e in self._outbound()["messages"]
+                     if e["text"] == "ans")
+        self.assertEqual(entry["correlation_id"], "e1")
+
+    def test_unrelated_sender_owner_echo_and_foreign_recipient_excluded(self):
+        self._inbound("f1")                                            # id 0 echo
+        app.store.add("claude", "chatter", channel="owner-telegram")   # id 1
+        app.store.add("codex-sol", "to-someone-else", channel="owner-telegram",
+                      metadata={"recipient": "claude"})                # id 2
+        app.store.add("codex-sol", "for owner", channel="owner-telegram")  # id 3
+        entries = self._outbound()["messages"]
+        self.assertEqual([e["text"] for e in entries], ["for owner"])
+        senders = {e["sender"] for e in entries}
+        self.assertNotIn("owner-telegram", senders)  # echo excluded
+        self.assertNotIn("claude", senders)          # unrelated excluded
+
+    def test_cursor_advances_across_filtered_records(self):
+        self._inbound("cf")                                            # id 0 echo
+        app.store.add("claude", "chatter", channel="owner-telegram")   # id 1
+        app.store.add("codex-sol", "x", channel="owner-telegram",
+                      metadata={"recipient": "claude"})                # id 2
+        body = self._outbound()
+        self.assertEqual(body["messages"], [])
+        self.assertEqual(body["cursor"], 2)  # past every filtered record
+
+    def test_restart_forward_poll_has_no_duplicates(self):
+        self._inbound("rr")                                            # id 0
+        app.store.add("codex-sol", "the answer", channel="owner-telegram")  # 1
+        body1 = self._outbound(since_id=0)
+        self.assertEqual([e["text"] for e in body1["messages"]], ["the answer"])
+        cursor = body1["cursor"]
+        # Restart, then resume strictly after the covered cursor.
+        self.h.close()
+        self.h = contract.build_contract_harness(
+            self.data_dir, bearer=BEARER, allowlist=ALLOWLIST
+        )
+        self.client = self.h.client
+        body2 = self._outbound(since_id=cursor)
+        self.assertEqual(body2["messages"], [])   # no duplicate after restart
+
+
+# --------------------------------------------------------------------------- #
+# C3 — outbound pagination is lossless (complete, ordered, exactly-once)
+# --------------------------------------------------------------------------- #
+class OutboundPaginationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.h = contract.build_contract_harness(
+            Path(self.tmp.name), bearer=BEARER, allowlist=ALLOWLIST
+        )
+        self.addCleanup(lambda: self.h.close())
+        self.client = self.h.client
+
+    def test_backlog_beyond_limit_paged_completely_in_order(self):
+        r = self.client.post(
+            contract.INBOUND_PATH, headers=AUTH,
+            json=contract.example_inbound_request(
+                correlation_id="bk",
+                telegram_user_id=USER_ID, telegram_chat_id=CHAT_ID),
+        )
+        self.assertEqual(r.status_code, 200)                           # id 0
+        for i in range(1, 6):                                          # ids 1..5
+            app.store.add("codex-sol", f"r{i}", channel="owner-telegram")
+
+        collected, since = [], 0
+        for _ in range(20):                       # bounded page loop, limit=2
+            body = self.client.get(
+                f"{contract.OUTBOUND_PATH}?since_id={since}&limit=2",
+                headers=AUTH,
+            ).json()
+            texts = [e["text"] for e in body["messages"]]
+            collected += texts
+            cursor = body["cursor"]
+            if cursor == since and not texts:
+                break
+            since = cursor
+        # Every reply delivered exactly once, in order, none dropped/reordered.
+        self.assertEqual(collected, ["r1", "r2", "r3", "r4", "r5"])
+        self.assertEqual(len(collected), len(set(collected)))
+
+
+# --------------------------------------------------------------------------- #
+# F4 — provisioning entrypoint is operationally deliverable and secret-safe
+# --------------------------------------------------------------------------- #
+class ProvisioningCliTests(unittest.TestCase):
+    def test_provision_cli_is_secret_safe(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = str(Path(d) / "telegram_route.json")
+            argv = ["provision", "--store", store, "--allow", f"{USER_ID}:{CHAT_ID}"]
+            with mock.patch("getpass.getpass", side_effect=[BEARER, BEARER]) as gp:
+                rc = telegram_route.main(list(argv))
+            self.assertEqual(rc, 0)
+            self.assertEqual(gp.call_count, 2)   # hidden entry + confirm
+            # The bearer never travelled through argv or the environment.
+            self.assertNotIn(BEARER, " ".join(argv))
+            self.assertTrue(all(BEARER not in v for v in os.environ.values()))
+            # At rest: salted digest only; no raw bearer, no bearer key.
+            raw = Path(store).read_text("utf-8")
+            self.assertNotIn(BEARER, raw)
+            data = json.loads(raw)
+            self.assertIn("bearer_hash", data)
+            self.assertIn("bearer_salt", data)
+            self.assertNotIn("bearer", data)
+            # The provisioned guard authenticates the bearer + allowlist pair.
+            guard = telegram_route.TelegramRouteGuard(store)
+            self.assertTrue(guard.verify_inbound(BEARER, USER_ID, CHAT_ID))
+
+    def test_provision_cli_mismatch_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = str(Path(d) / "telegram_route.json")
+            with mock.patch("getpass.getpass", side_effect=["A", "B"]):
+                rc = telegram_route.main(
+                    ["provision", "--store", store, "--allow", "1:2"]
+                )
+            self.assertEqual(rc, 2)
+            self.assertFalse(Path(store).exists())
+
+    def test_provision_cli_requires_allowlist(self):
+        with self.assertRaises(SystemExit):
+            telegram_route.main(["provision", "--store", "unused.json"])
 
 
 if __name__ == "__main__":

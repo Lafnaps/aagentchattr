@@ -56,6 +56,7 @@ def example_inbound_request(
     correlation_id: str = "tg-42",
     telegram_user_id: int | str = 100200300,
     telegram_chat_id: int | str = 100200300,
+    telegram_message_id: int | str = 4242,
     recipient: str | None = None,
     channel: str | None = None,
 ) -> dict:
@@ -72,6 +73,7 @@ def example_inbound_request(
         "correlation_id": correlation_id,
         "telegram_user_id": telegram_user_id,
         "telegram_chat_id": telegram_chat_id,
+        "telegram_message_id": telegram_message_id,
     }
     if recipient is not None:
         body["recipient"] = recipient
@@ -98,7 +100,8 @@ def example_outbound_response(*, messages: list[dict] | None = None,
 
     Each entry preserves the monotonic ``id`` cursor, the canonical
     ``recipient`` (``owner-telegram``), the ``correlation_id`` linking the reply
-    to its inbound question, plus ``sender``/``text``/``channel``.  The bridge
+    to its inbound question, the source Telegram ``reply_to_message_id``, plus
+    ``sender``/``text``/``channel``.  The bridge
     resumes from ``cursor`` via ``?since_id=<cursor>``; ``cursor`` is the id of
     the last message COVERED by this page (scanned, whether or not selected), so
     forward polling never rescans, skips or reorders a reply.

@@ -216,7 +216,8 @@ def inject(text: str, *, delay: float = 0.3, enter_backend: str = "console_input
 def _injection_attempt(text: str, *, delay: float = 0.3,
                        enter_backend: str = "console_input",
                        safeguard_guard: bool = False,
-                       composer_guard=None) -> dict:
+                       composer_guard=None,
+                       allow_active: bool = False) -> dict:
     """One fail-closed admission-gated injection attempt.
 
     Runs entirely under _inject_lock; never invokes callbacks (the caller
@@ -253,7 +254,10 @@ def _injection_attempt(text: str, *, delay: float = 0.3,
             if composer_guard is not None:
                 composer_guard.reset_stability()
         elif composer_guard is not None:
-            admission = composer_guard.classify(screen)
+            admission = (
+                composer_guard.classify_active(screen)
+                if allow_active else composer_guard.classify(screen)
+            )
             if admission != "admit":
                 classification = admission
         if classification is None:
@@ -460,7 +464,7 @@ def _make_admitted_injector(*, delay: float = 0.3,
         _schedule_probe(clock())
         return False
 
-    def _run(text: str) -> str:
+    def _run_mode(text: str, *, allow_active: bool = False) -> str:
         # Direct callers are protected too.  The queue watcher normally calls
         # retry_after()/recovery_probe() before beginning its journal
         # transaction; this fallback preserves the same no-retype invariant.
@@ -474,6 +478,7 @@ def _make_admitted_injector(*, delay: float = 0.3,
             enter_backend=enter_backend,
             safeguard_guard=safeguard_guard,
             composer_guard=composer_guard,
+            allow_active=allow_active,
         )
         status = result["status"]
         if status == "injected":
@@ -505,11 +510,22 @@ def _make_admitted_injector(*, delay: float = 0.3,
             emit(result["event"])
         return status
 
+    def _run(text: str) -> str:
+        return _run_mode(text)
+
+    def _run_active(text: str) -> str:
+        # Telegram owner ingress is canonically routed only to Codex. Keep the
+        # active-turn exception unavailable to every other provider.
+        if composer_guard is None or composer_guard.provider != "codex":
+            return _run_mode(text)
+        return _run_mode(text, allow_active=True)
+
     # Small duck-typed protocol consumed by wrapper._queue_watcher.  Keeping
     # it on the callable preserves compatibility with existing start_watcher
     # and legacy injectors.
     _run.retry_after = _retry_after
     _run.recovery_probe = _recovery_probe
+    _run.inject_active = _run_active
     return _run
 
 
@@ -1176,6 +1192,26 @@ class _ComposerAdmissionGuard:
         if self._stable_hits >= self.stable_reads:
             return "admit"
         return "busy"
+
+    def classify_active(self, screen: str) -> str:
+        """Admit an owner interrupt into an active Codex turn only when the
+        provider composer is positively recognized as empty.
+
+        Normal agent triggers still use classify() and retain the full-screen
+        stable-idle requirement. The exact post-type composer equality check
+        remains mandatory before Enter is emitted.
+        """
+        state, _content, _row = _composer_state(
+            screen, self.markers, self.placeholders,
+            self.separator, self.empty_requires_separator,
+        )
+        if state == "unrecognized":
+            self.reset_stability()
+            return "unrecognized-composer"
+        if state == "nonempty":
+            self.reset_stability()
+            return "nonempty-composer"
+        return "admit"
 
 
 class _SafeguardRetryController:

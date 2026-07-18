@@ -46,6 +46,7 @@ from agents import AgentTrigger
 BEARER = "ROUTE-BEARER-SENTINEL-9z9z"
 USER_ID = 771234567
 CHAT_ID = 889876543
+TELEGRAM_MESSAGE_ID = 4242
 ALLOWLIST = [(USER_ID, CHAT_ID)]
 AUTH = {"Authorization": f"Bearer {BEARER}"}
 
@@ -94,7 +95,8 @@ class RouteHelperTests(unittest.TestCase):
     def test_addressing_and_correlation_resolution(self):
         owner = {
             "id": 1, "sender": telegram_route.OWNER_IDENTITY,
-            "metadata": {"recipient": "codex-sol", "correlation_id": "cid-x"},
+            "metadata": {"recipient": "codex-sol", "correlation_id": "cid-x",
+                         "telegram_message_id": TELEGRAM_MESSAGE_ID},
         }
         store = {1: owner}
 
@@ -124,6 +126,24 @@ class RouteHelperTests(unittest.TestCase):
         self.assertIsNone(
             telegram_route.resolve_correlation(mentioned, resolve)
         )
+        self.assertEqual(
+            telegram_route.resolve_telegram_reply_to(replied, resolve),
+            TELEGRAM_MESSAGE_ID,
+        )
+        self.assertEqual(
+            telegram_route.resolve_telegram_reply_to(
+                unrelated, resolve, preceding_request=owner
+            ),
+            TELEGRAM_MESSAGE_ID,
+        )
+
+    def test_telegram_message_id_normalization_is_positive_integer_only(self):
+        for value in (1, TELEGRAM_MESSAGE_ID, " 4242 "):
+            self.assertEqual(
+                telegram_route.normalize_tg_message_id(value), int(value)
+            )
+        for value in (None, True, False, 0, -1, "", "-1", "1.2", object()):
+            self.assertIsNone(telegram_route.normalize_tg_message_id(value))
 
 
 # --------------------------------------------------------------------------- #
@@ -253,10 +273,12 @@ class RouteHttpContractTests(unittest.TestCase):
         self.assertEqual(len(body["messages"]), 1)
         entry = body["messages"][0]
         self.assertEqual(set(entry), {"id", "sender", "recipient",
-                                      "correlation_id", "text", "channel"})
+                                      "correlation_id", "reply_to_message_id",
+                                      "text", "channel"})
         self.assertEqual(entry["recipient"], "owner-telegram")
         self.assertEqual(entry["sender"], "codex-sol")
         self.assertEqual(entry["correlation_id"], "tg-9")
+        self.assertEqual(entry["reply_to_message_id"], TELEGRAM_MESSAGE_ID)
         self.assertEqual(body["cursor"], entry["id"])
 
     # --- two-factor gate + every one-factor negative ---
@@ -269,6 +291,13 @@ class RouteHttpContractTests(unittest.TestCase):
         self.assertEqual(msgs[0]["sender"], "owner-telegram")
         # Durable wake enqueued to the canonical responder queue.
         self.assertTrue(self.h.responder_queue_path().exists())
+        wake = json.loads(
+            self.h.responder_queue_path().read_text("utf-8").splitlines()[0]
+        )
+        self.assertIn("chat_read_exact", wake["prompt"])
+        self.assertIn(f"message_id={r.json()['cursor']}", wake["prompt"])
+        self.assertIn(f"reply_to={r.json()['cursor']}", wake["prompt"])
+        self.assertNotIn("What is the current task status", wake["prompt"])
 
     def test_every_one_factor_only_case_is_rejected_before_effect(self):
         cases = {
@@ -316,6 +345,18 @@ class RouteHttpContractTests(unittest.TestCase):
         r = self._inbound(recipient="claude", correlation_id="c-badrcpt")
         self.assertEqual(r.status_code, 400)
         self.assertEqual(r.json(), {"error": "invalid recipient"})
+
+    def test_missing_or_invalid_telegram_message_id_refused_before_effect(self):
+        for value in (None, True, 0, -1, "", "bad"):
+            with self.subTest(value=value):
+                r = self._inbound(
+                    correlation_id=f"bad-mid-{value!r}",
+                    telegram_message_id=value,
+                )
+                self.assertEqual(r.status_code, 400)
+                self.assertEqual(r.json(), {"error": "invalid request"})
+        self.assertEqual(app.store.get_recent(10, channel="owner-telegram"), [])
+        self.assertFalse(self.h.responder_queue_path().exists())
 
     def test_missing_fields_refused(self):
         r = self.client.post(contract.INBOUND_PATH, headers=AUTH,
@@ -472,6 +513,9 @@ class DurableRouteTests(unittest.TestCase):
         self.assertEqual(rec["channel"], "owner-telegram")
         self.assertEqual(rec.get("text"), "")           # NO body in the wake
         self.assertIn("action_id", rec)
+        self.assertIn("chat_read_exact", rec["prompt"])
+        self.assertIn("message_id=0", rec["prompt"])
+        self.assertIn("reply_to=0", rec["prompt"])
 
         # 2) Simulate a server restart: the durable message store reopens from
         #    the same data dir with the owner message intact.
@@ -494,8 +538,11 @@ class DurableRouteTests(unittest.TestCase):
 
         self._run_watcher_once(inject, done, threading.Event())
         self.assertEqual(len(prompts), 1)
-        self.assertIn("#owner-telegram", prompts[0])
-        # The injected wake carries no owner body — only the channel pointer.
+        self.assertIn("channel='owner-telegram'", prompts[0])
+        self.assertIn("chat_read_exact", prompts[0])
+        self.assertIn("message_id=0", prompts[0])
+        self.assertIn("reply_to=0", prompts[0])
+        # The injected wake carries no owner body — only the exact pointer.
         self.assertNotIn("What is the current task status", prompts[0])
 
         # 4) A second run (e.g. another restart) replays nothing: exactly-once.
@@ -624,6 +671,23 @@ class InboundIdempotencyTests(unittest.TestCase):
         recs = self._wake_records()
         self.assertEqual(len(recs), 1)
         self.assertEqual(len({r.get("action_id") for r in recs}), 1)
+        self.assertIn("message_id=0", recs[0]["prompt"])
+        self.assertIn("reply_to=0", recs[0]["prompt"])
+
+    def test_same_correlation_with_different_telegram_message_id_conflicts(self):
+        first = self._post(
+            correlation_id="mid-conflict", text="same body",
+            telegram_message_id=100,
+        )
+        second = self._post(
+            correlation_id="mid-conflict", text="same body",
+            telegram_message_id=101,
+        )
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 409)
+        self.assertEqual(second.json(), {"error": "conflict"})
+        self.assertEqual(len(self._owner_messages()), 1)
+        self.assertEqual(len(self._wake_records()), 1)
 
     def test_concurrent_same_request_yields_one_message_and_one_wake(self):
         barrier = threading.Barrier(2)
@@ -708,12 +772,13 @@ class OutboundOrdinaryResponseTests(unittest.TestCase):
         self.addCleanup(lambda: self.h.close())
         self.client = self.h.client
 
-    def _inbound(self, correlation_id):
+    def _inbound(self, correlation_id, telegram_message_id=TELEGRAM_MESSAGE_ID):
         r = self.client.post(
             contract.INBOUND_PATH, headers=AUTH,
             json=contract.example_inbound_request(
                 correlation_id=correlation_id,
-                telegram_user_id=USER_ID, telegram_chat_id=CHAT_ID),
+                telegram_user_id=USER_ID, telegram_chat_id=CHAT_ID,
+                telegram_message_id=telegram_message_id),
         )
         self.assertEqual(r.status_code, 200)
         return r
@@ -737,19 +802,23 @@ class OutboundOrdinaryResponseTests(unittest.TestCase):
         self.assertEqual(entry["text"], "plain answer")
         # Correlation inherited from the preceding owner request.
         self.assertEqual(entry["correlation_id"], "tg-ord")
+        self.assertEqual(entry["reply_to_message_id"], TELEGRAM_MESSAGE_ID)
 
     def test_multiple_sequential_pairs_map_deterministically(self):
-        self._inbound("q1")                                            # id 0
+        self._inbound("q1", 5101)                                      # id 0
         app.store.add("codex-sol", "ans1", channel="owner-telegram")   # id 1
-        self._inbound("q2")                                            # id 2
+        self._inbound("q2", 5102)                                      # id 2
         app.store.add("codex-sol", "ans2", channel="owner-telegram")   # id 3
         got = {e["text"]: e["correlation_id"]
                for e in self._outbound()["messages"]}
         self.assertEqual(got, {"ans1": "q1", "ans2": "q2"})
+        reply_targets = {e["text"]: e["reply_to_message_id"]
+                         for e in self._outbound()["messages"]}
+        self.assertEqual(reply_targets, {"ans1": 5101, "ans2": 5102})
 
     def test_explicit_reply_takes_precedence_over_sequential_rule(self):
-        self._inbound("e1")                                            # id 0
-        self._inbound("e2")                                            # id 1
+        self._inbound("e1", 5201)                                      # id 0
+        self._inbound("e2", 5202)                                      # id 1
         # Reply explicitly to the FIRST question even though the second is the
         # most recent preceding owner request.
         app.store.add("codex-sol", "ans", channel="owner-telegram",
@@ -757,6 +826,7 @@ class OutboundOrdinaryResponseTests(unittest.TestCase):
         entry = next(e for e in self._outbound()["messages"]
                      if e["text"] == "ans")
         self.assertEqual(entry["correlation_id"], "e1")
+        self.assertEqual(entry["reply_to_message_id"], 5201)
 
     def test_unrelated_sender_owner_echo_and_foreign_recipient_excluded(self):
         self._inbound("f1")                                            # id 0 echo

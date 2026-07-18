@@ -109,6 +109,20 @@ def normalize_tg_id(value: object) -> str:
     return ""
 
 
+def normalize_tg_message_id(value: object) -> int | None:
+    """Return a positive Telegram message id, or ``None`` when invalid."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str):
+        token = value.strip()
+        if token.isascii() and token.isdigit():
+            parsed = int(token)
+            return parsed if parsed > 0 else None
+    return None
+
+
 def stable_inbound_action_id(correlation_id: str, uid: str) -> str:
     """Generation-independent idempotency key for the durable inbound wake.
 
@@ -267,7 +281,8 @@ def find_persisted_inbound(channel_messages, correlation_id: str) -> dict | None
     return None
 
 
-def inbound_envelope_matches(existing: dict, recipient: str, text: str) -> bool:
+def inbound_envelope_matches(existing: dict, recipient: str, text: str,
+                             telegram_message_id: int) -> bool:
     """Whether a retry's envelope matches the already-persisted owner message.
 
     The logical request is identified by its correlation id; a retry is only
@@ -276,10 +291,36 @@ def inbound_envelope_matches(existing: dict, recipient: str, text: str) -> bool:
     the caller must fail closed (without disclosing which field differs).
     """
     meta = existing.get("metadata") or {}
-    return meta.get("recipient") == recipient and existing.get("text") == text
+    return (
+        meta.get("recipient") == recipient
+        and existing.get("text") == text
+        and meta.get("telegram_message_id") == telegram_message_id
+    )
 
 
-def outbound_entry(message: dict, correlation_id: str | None) -> dict:
+def resolve_telegram_reply_to(message: dict, resolve_reply,
+                              preceding_request: dict | None = None) -> int | None:
+    """Resolve the Telegram message id an outbound response should quote.
+
+    An explicit reply to an owner message wins. Otherwise the ordinary
+    dedicated-channel response quotes the most recent preceding owner request.
+    Only the positive integer stored by authenticated Telegram ingress is
+    accepted; no id is inferred or fabricated.
+    """
+    parent = None
+    reply_id = message.get("reply_to")
+    if reply_id is not None:
+        candidate = resolve_reply(reply_id)
+        if candidate and candidate.get("sender") == OWNER_IDENTITY:
+            parent = candidate
+    if parent is None:
+        parent = preceding_request
+    metadata = (parent or {}).get("metadata") or {}
+    return normalize_tg_message_id(metadata.get("telegram_message_id"))
+
+
+def outbound_entry(message: dict, correlation_id: str | None,
+                   reply_to_message_id: int | None = None) -> dict:
     """Build the bounded outbound wire entry for the bridge.
 
     Explicitly carries the monotonic message-id cursor, the canonical
@@ -290,6 +331,7 @@ def outbound_entry(message: dict, correlation_id: str | None) -> dict:
         "sender": message.get("sender"),
         "recipient": OWNER_IDENTITY,
         "correlation_id": correlation_id,
+        "reply_to_message_id": reply_to_message_id,
         "text": message.get("text", ""),
         "channel": message.get("channel", ROUTE_CHANNEL),
     }

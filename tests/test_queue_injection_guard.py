@@ -194,6 +194,22 @@ class AdmissionGuardTests(unittest.TestCase):
         for screen in (screen_a, screen_b, screen_a, screen_b, screen_a):
             self.assertEqual(guard.classify(screen), "busy")
 
+    def test_owner_interrupt_admits_empty_codex_during_active_turn(self):
+        guard = self._guard()
+        active = CODEX_IDLE.replace("2m 10s", "2m 47s")
+        self.assertEqual(guard.classify_active(active), "admit")
+
+    def test_owner_interrupt_refuses_nonempty_or_unrecognized_composer(self):
+        guard = self._guard()
+        self.assertEqual(
+            guard.classify_active(_codex_screen_with_text("manual draft")),
+            "nonempty-composer",
+        )
+        self.assertEqual(
+            guard.classify_active("active transcript without a composer"),
+            "unrecognized-composer",
+        )
+
     def test_nonempty_composer_defers_and_resets_stability(self):
         guard = self._guard()
         guard.classify(CODEX_IDLE)
@@ -340,7 +356,7 @@ class InjectAttemptTests(unittest.TestCase):
         return write_console_input
 
     def _attempt(self, text, screens, guard, calls, safeguard_guard=False,
-                 partial_enter=False):
+                 partial_enter=False, allow_active=False):
         with (
             mock.patch.object(
                 wrapper_windows.kernel32, "GetStdHandle", return_value=123
@@ -363,6 +379,7 @@ class InjectAttemptTests(unittest.TestCase):
                 text,
                 safeguard_guard=safeguard_guard,
                 composer_guard=guard,
+                allow_active=allow_active,
             )
 
     def test_active_child_defers_without_any_input(self):
@@ -433,6 +450,39 @@ class InjectAttemptTests(unittest.TestCase):
         self.assertEqual(
             [(down) for _c, down, _vk in enter_batches[0]], [True, False]
         )
+
+    def test_owner_interrupt_injects_during_active_codex_turn(self):
+        text = "use mcp to read #owner-telegram - owner interrupt"
+        guard = wrapper_windows._ComposerAdmissionGuard("codex")
+        calls = []
+        result = self._attempt(
+            text,
+            [CODEX_IDLE.replace("2m 10s", "7m 03s"),
+             _codex_screen_with_text(text)],
+            guard,
+            calls,
+            allow_active=True,
+        )
+        self.assertEqual(result["status"], "injected")
+        enter_batches = [
+            batch for batch in calls
+            if batch and batch[0][2] == wrapper_windows.VK_RETURN
+        ]
+        self.assertEqual(len(enter_batches), 1)
+
+    def test_owner_interrupt_hook_is_codex_only(self):
+        guard = wrapper_windows._ComposerAdmissionGuard("claude")
+        injector = wrapper_windows._make_admitted_injector(
+            composer_guard=guard
+        )
+        with mock.patch.object(
+            wrapper_windows, "_injection_attempt",
+            return_value={"status": "deferred", "classification": "busy",
+                          "event": {}},
+        ) as attempt:
+            injector.inject_active("owner interrupt")
+        self.assertFalse(attempt.call_args.kwargs["allow_active"])
+
 
     def test_redraw_between_text_and_enter_suppresses_enter(self):
         text = "use mcp to read #lane-test1 - task"
@@ -585,6 +635,44 @@ class InjectAttemptTests(unittest.TestCase):
                             for event in watchdogs))
         self.assertTrue(all(event["max_retry_seconds"] == 60.0
                             for event in watchdogs))
+
+
+class OwnerInterruptDispatchTests(unittest.TestCase):
+    def test_bounded_inject_uses_active_hook_for_owner_interrupt(self):
+        calls = []
+
+        def regular(prompt):
+            calls.append(("regular", prompt))
+            return "deferred"
+
+        def active(prompt):
+            calls.append(("active", prompt))
+            return "injected"
+
+        regular.inject_active = active
+        result = wrapper._call_inject_bounded(
+            regular, "owner prompt", 1.0, allow_active=True
+        )
+        self.assertEqual(result, "injected")
+        self.assertEqual(calls, [("active", "owner prompt")])
+
+    def test_normal_trigger_does_not_use_active_hook(self):
+        calls = []
+
+        def regular(prompt):
+            calls.append(("regular", prompt))
+            return "injected"
+
+        def active(prompt):
+            calls.append(("active", prompt))
+            return "injected"
+
+        regular.inject_active = active
+        result = wrapper._call_inject_bounded(
+            regular, "normal prompt", 1.0
+        )
+        self.assertEqual(result, "injected")
+        self.assertEqual(calls, [("regular", "normal prompt")])
 
 
 class QueueCursorTests(unittest.TestCase):
@@ -932,6 +1020,28 @@ class WatcherDurabilityTests(unittest.TestCase):
 
         self._run_watcher(recovered_inject, done)
         self.assertTrue(any("#lane-test1" in p for p in prompts))
+        self.assertEqual(self._cursor_offset(), len(payload))
+
+    def test_owner_telegram_event_uses_active_interrupt_hook(self):
+        payload = b'{"channel": "owner-telegram"}\n'
+        self.queue.write_bytes(payload)
+        calls = []
+        done = threading.Event()
+
+        def regular(prompt):
+            calls.append(("regular", prompt))
+            return "deferred"
+
+        def active(prompt):
+            calls.append(("active", prompt))
+            done.set()
+            return "injected"
+
+        regular.inject_active = active
+        self._run_watcher(regular, done)
+
+        self.assertEqual([kind for kind, _prompt in calls], ["active"])
+        self.assertIn("#owner-telegram", calls[0][1])
         self.assertEqual(self._cursor_offset(), len(payload))
 
     def test_terminal_results_consume_batch(self):

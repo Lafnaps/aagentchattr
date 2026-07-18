@@ -2758,10 +2758,11 @@ async def api_telegram_inbound(request: Request):
     persisted to the #owner-telegram channel with its correlation id, and the
     canonical responder `codex-sol` is durably woken exactly once — the wake
     survives the responder being offline and survives a server restart, and it
-    carries no message body (the responder reads #owner-telegram itself).
+    carries no message body, only the exact persisted message id to read and
+    quote in the response.
 
     Wire request (JSON): {text, correlation_id, telegram_user_id,
-    telegram_chat_id, recipient?, channel?}.  Wire response: {status,
+    telegram_chat_id, telegram_message_id, recipient?, channel?}.  Wire response: {status,
     recipient, channel, correlation_id, cursor}.  Raw bearer, user/chat ids and
     message bodies never enter logs, errors, metrics or response diagnostics.
     """
@@ -2797,11 +2798,17 @@ async def api_telegram_inbound(request: Request):
     if not isinstance(text, str) or not text.strip():
         return JSONResponse({"error": "text is required"}, status_code=400)
     text = text.strip()
+    telegram_message_id = telegram_route.normalize_tg_message_id(
+        body.get("telegram_message_id")
+    )
+    if telegram_message_id is None:
+        return JSONResponse({"error": "invalid request"}, status_code=400)
 
     metadata = {
         "recipient": recipient,
         "correlation_id": correlation_id,
         "source": "telegram-owner",
+        "telegram_message_id": telegram_message_id,
     }
 
     # Idempotent find-or-create + wake, serialized so sequential/concurrent
@@ -2819,7 +2826,9 @@ async def api_telegram_inbound(request: Request):
             # message (so no new uid, hence a stable wake action_id) — unless
             # the correlation id was reused for a DIFFERENT envelope, which is
             # a conflict we fail closed generically before any second effect.
-            if not telegram_route.inbound_envelope_matches(existing, recipient, text):
+            if not telegram_route.inbound_envelope_matches(
+                existing, recipient, text, telegram_message_id
+            ):
                 return JSONResponse({"error": "conflict"}, status_code=409)
             message = existing
         else:
@@ -2832,7 +2841,9 @@ async def api_telegram_inbound(request: Request):
                 return JSONResponse({"error": admission_error}, status_code=status)
 
         # Durable wake of the canonical responder via the existing per-agent
-        # queue.  The wake carries no body; the action_id is stable for the
+        # queue.  The wake carries no body; its prompt names only the exact
+        # persisted chat id so a later outbound id cannot skip this inbound.
+        # The action_id is stable for the
         # logical request (correlation id + the reused message uid), so the
         # AgentTrigger/journal dedup collapses retries to one wake — and a retry
         # after the message persisted but the queue append hit backpressure
@@ -2842,8 +2853,16 @@ async def api_telegram_inbound(request: Request):
         )
         try:
             if agents is not None:
+                exact_prompt = (
+                    "use MCP chat_read_exact(channel="
+                    f"'{channel}', message_id={message['id']}) to read the "
+                    "Telegram owner message; take appropriate action and "
+                    "respond in the same channel with "
+                    f"reply_to={message['id']}"
+                )
                 agents.trigger_sync(
-                    recipient, message="", channel=channel, action_id=action_id,
+                    recipient, message="", channel=channel,
+                    action_id=action_id, prompt=exact_prompt,
                 )
         except DeliveryBackpressureError:
             return JSONResponse(
@@ -2920,7 +2939,12 @@ async def api_telegram_outbound(request: Request):
         correlation_id = telegram_route.resolve_correlation(
             message, store.get_by_id, preceding_request=preceding
         )
-        entries.append(telegram_route.outbound_entry(message, correlation_id))
+        reply_to_message_id = telegram_route.resolve_telegram_reply_to(
+            message, store.get_by_id, preceding_request=preceding
+        )
+        entries.append(telegram_route.outbound_entry(
+            message, correlation_id, reply_to_message_id
+        ))
         if len(entries) >= limit:
             break
 

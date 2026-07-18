@@ -1359,7 +1359,8 @@ def _nonterminal_delivery_state(result) -> str:
     return "retry"
 
 
-def _call_inject_bounded(inject_fn, prompt: str, timeout_seconds: float):
+def _call_inject_bounded(inject_fn, prompt: str, timeout_seconds: float,
+                         *, allow_active: bool = False):
     """Run a possibly blocking injector without wedging the queue watcher.
 
     Python cannot safely kill a thread.  On timeout we therefore leave the
@@ -1371,7 +1372,13 @@ def _call_inject_bounded(inject_fn, prompt: str, timeout_seconds: float):
 
     def invoke():
         try:
-            outcome["result"] = inject_fn(prompt)
+            active_inject = getattr(inject_fn, "inject_active", None)
+            target = (
+                active_inject
+                if allow_active and callable(active_inject)
+                else inject_fn
+            )
+            outcome["result"] = target(prompt)
         except BaseException as exc:  # re-raised in the watcher thread
             outcome["error"] = exc
         finally:
@@ -1680,6 +1687,10 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                 result = _call_inject_bounded(
                     inject_fn, prompt.replace("\n", " "),
                     inject_timeout_seconds,
+                    allow_active=any(
+                        event.get("channel") == "owner-telegram"
+                        for event in events
+                    ),
                 )
                 terminal_state = _terminal_delivery_state(result)
                 if terminal_state is not None:

@@ -109,6 +109,33 @@ class ComposerStateTests(unittest.TestCase):
             )
             self.assertEqual((state, content), ("empty", suggestion))
 
+    def test_claude_builtin_suggestions_are_empty_placeholders(self):
+        guard = wrapper_windows._ComposerAdmissionGuard("claude")
+        suggestions = wrapper_windows._COMPOSER_PROFILES["claude"][
+            "placeholders"
+        ]
+        self.assertEqual(len(suggestions), 8)
+        for suggestion in suggestions:
+            state, content, _row = wrapper_windows._composer_state(
+                f"transcript\n❯{NBSP}{suggestion}\nstatus",
+                guard.markers,
+                guard.placeholders,
+                guard.separator,
+                guard.empty_requires_separator,
+            )
+            self.assertEqual((state, content), ("empty", suggestion))
+
+    def test_claude_unknown_try_text_remains_nonempty(self):
+        guard = wrapper_windows._ComposerAdmissionGuard("claude")
+        state, content, _row = wrapper_windows._composer_state(
+            f'transcript\n❯{NBSP}Try "my operator draft"\nstatus',
+            guard.markers,
+            guard.placeholders,
+            guard.separator,
+            guard.empty_requires_separator,
+        )
+        self.assertEqual((state, content), ("nonempty", 'Try "my operator draft"'))
+
     def test_live_shaped_fable_empty_composer(self):
         self.assertEqual(self._claude(FABLE_IDLE)[0], "empty")
 
@@ -249,9 +276,34 @@ class AdmissionGuardTests(unittest.TestCase):
     def test_resolve_provider(self):
         resolve = wrapper_windows._resolve_composer_provider
         self.assertEqual(resolve("codex"), "codex")
+        self.assertEqual(resolve("codex-sol"), "codex")
+        self.assertEqual(resolve("claude-opus"), "claude")
         self.assertEqual(resolve("fable-infra"), "claude")
         self.assertEqual(resolve("mystery", r"C:\bin\claude.EXE"), "claude")
         self.assertEqual(resolve("mystery"), "")
+
+    def test_activity_normalization_ignores_rotating_empty_suggestions(self):
+        normalize = wrapper_windows._normalize_activity_screen
+        first = "\n".join([
+            "stable transcript".ljust(80),
+            f'❯{NBSP}Try "fix lint errors"'.ljust(80),
+            "stable status".ljust(80),
+        ])
+        second = "\n".join([
+            "stable transcript".ljust(80),
+            f'❯{NBSP}Try "write a test for <filepath>"'.ljust(80),
+            "stable status".ljust(80),
+        ])
+        self.assertEqual(normalize(first, "claude"), normalize(second, "claude"))
+
+    def test_activity_normalization_preserves_real_composer_text(self):
+        normalize = wrapper_windows._normalize_activity_screen
+        draft = "\n".join([
+            "stable transcript",
+            f"❯{NBSP}operator draft",
+            "stable status",
+        ])
+        self.assertEqual(normalize(draft, "claude"), draft)
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only injection gate")
@@ -308,6 +360,37 @@ class TypedTextVisibleTests(unittest.TestCase):
             f"│ ❯{NBSP}use mcp to read #lane-",
             "│ test1 - taskZ",
             "╰──────────────────────────╯",
+        ])
+        self.assertFalse(
+            self._visible(post, provider="claude", pre=FABLE_IDLE)
+        )
+
+    def test_claude_atomic_paste_pill_after_empty_composer_passes(self):
+        post = "\n".join([
+            "transcript output",
+            f"❯{NBSP}[Pasted text #1]",
+            "status",
+        ])
+        self.assertTrue(
+            self._visible(post, provider="claude", pre=FABLE_IDLE)
+        )
+
+    def test_claude_paste_pill_without_empty_precondition_suppresses(self):
+        post = "\n".join([
+            "transcript output",
+            f"❯{NBSP}[Pasted text #12]",
+            "status",
+        ])
+        nonempty_pre = _fable_screen_with_text("operator draft")
+        self.assertFalse(
+            self._visible(post, provider="claude", pre=nonempty_pre)
+        )
+
+    def test_claude_paste_like_operator_text_suppresses(self):
+        post = "\n".join([
+            "transcript output",
+            f"❯{NBSP}[Pasted text from operator]",
+            "status",
         ])
         self.assertFalse(
             self._visible(post, provider="claude", pre=FABLE_IDLE)
@@ -1326,6 +1409,12 @@ class WatcherDurabilityTests(unittest.TestCase):
         self.assertNotIn("\n", prompts[0])
         self.assertIn("ROLE: release lane", prompts[0])
         self.assertIn("rule one; rule two", prompts[0])
+
+    def test_identity_hint_binds_current_wrapper_name_without_reclaim(self):
+        hint = wrapper._identity_hint("claude-work-fable")
+        self.assertIn("@claude-work-fable", hint)
+        self.assertIn("do not reclaim", hint)
+        self.assertNotIn("chat history", hint)
 
     def test_long_rules_use_bounded_mcp_refresh_instruction(self):
         self.queue.write_bytes(b'{"channel": "lane-test1"}\n')

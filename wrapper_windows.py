@@ -8,6 +8,7 @@ from ctypes import wintypes
 import hashlib
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import threading
@@ -963,6 +964,20 @@ _COMPOSER_PROFILES: dict[str, dict] = {
         "markers": ("❯",),
         "separator": " ",
         "empty_requires_separator": True,
+        # Claude Code 2.1.215 renders one rotating suggestion as visible
+        # composer text even though the input buffer is empty.  Keep the
+        # exact built-in strings here: broad/pattern matching could mistake
+        # an operator draft for an empty composer and overwrite it.
+        "placeholders": (
+            'Try "fix lint errors"',
+            'Try "fix typecheck errors"',
+            'Try "how does <filepath> work?"',
+            'Try "refactor <filepath>"',
+            'Try "how do I log an error?"',
+            'Try "edit <filepath> to..."',
+            'Try "write a test for <filepath>"',
+            'Try "create a util logging.py that..."',
+        ),
     },
     "codex": {
         # "›" — the Codex TUI prompt marker, plain-space separated
@@ -999,12 +1014,44 @@ def _resolve_composer_provider(agent: str, command: str = "") -> str:
     """Map a wrapper agent to a composer profile. Empty string = unknown."""
     if agent in _COMPOSER_PROFILES:
         return agent
+    if agent.startswith("claude-"):
+        return "claude"
+    if agent.startswith("codex-"):
+        return "codex"
     if agent.startswith("fable"):
         return "claude"  # fable-* wrappers run the Claude Code CLI
     stem = Path(command).stem.lower() if command else ""
     if stem in _COMPOSER_PROFILES:
         return stem
     return ""
+
+
+def _normalize_activity_screen(screen: str, provider: str) -> str:
+    """Remove only a positively empty composer row from activity hashing.
+
+    Rotating provider suggestions change many visible cells while the child is
+    idle.  Hashing them verbatim keeps `/api/status` falsely busy forever.
+    Replacing the complete row is safe only after the same provider-shaped
+    parser used by the injection guard proves it empty; real drafts, paste
+    pills, tool output and thinking/status rows remain byte-significant.
+    """
+    profile = _COMPOSER_PROFILES.get(provider or "")
+    if not profile:
+        return screen
+    state, _content, row = _composer_state(
+        screen,
+        tuple(profile.get("markers", ())),
+        tuple(profile.get("placeholders", ())),
+        profile.get("separator", " "),
+        bool(profile.get("empty_requires_separator", False)),
+    )
+    if state != "empty" or row < 0:
+        return screen
+    lines = screen.split("\n")
+    if row >= len(lines):
+        return screen
+    lines[row] = " " * len(lines[row])
+    return "\n".join(lines)
 
 
 def _strip_composer_row(line: str) -> str:
@@ -1083,6 +1130,27 @@ def _typed_text_visible(post_screen: str, pre_screen, text: str,
         # empty (batch vanished) or unrecognized (no positive region
         # binding — e.g. marker row scrolled out): never Enter.
         return False
+
+    # Claude Code may collapse one atomic WriteConsoleInputW text batch into
+    # an exact paste pill instead of rendering the inserted characters.  The
+    # input records were already confirmed as a complete batch by
+    # _write_text_batch; when the immediately preceding screen positively
+    # showed an empty provider composer, this pill is positive evidence that
+    # *our* batch owns the composer.  Keep the match exact and provider-bound:
+    # arbitrary bracketed text or a pill present before injection must never
+    # authorize Enter.
+    if composer_guard.provider == "claude" and re.fullmatch(
+        r"\[Pasted text #\d+\]", content
+    ):
+        pre_state, _pre_content, _pre_row = _composer_state(
+            pre_screen or "",
+            composer_guard.markers,
+            composer_guard.placeholders,
+            composer_guard.separator,
+            composer_guard.empty_requires_separator,
+        )
+        return pre_state == "empty"
+
     accumulated = _nospace(content)
     if not text_ns.startswith(accumulated):
         return False
@@ -1436,6 +1504,7 @@ def get_activity_checker(pid_holder, agent_name="unknown", trigger_flag=None):
     IDLE_COOLDOWN = 5       # need 5 consecutive idle polls (5s) before going idle
     _consecutive_idle = [0]
     _is_active = [False]
+    activity_provider = _resolve_composer_provider(agent_name)
 
     def check():
         # External trigger: queue watcher injected a message → force active
@@ -1474,7 +1543,22 @@ def get_activity_checker(pid_holder, agent_name="unknown", trigger_flag=None):
         raw = bytes(char_info_array)
         shorts = _array.array("H")
         shorts.frombytes(raw)
-        char_data = shorts[::2].tobytes()
+        char_units = shorts[::2]
+        if activity_provider:
+            rows = []
+            for row in range(height):
+                start = row * width
+                rows.append("".join(
+                    chr(value) for value in char_units[start:start + width]
+                ))
+            normalized = _normalize_activity_screen(
+                "\n".join(rows), activity_provider
+            )
+            char_data = normalized.replace("\n", "").encode(
+                "utf-16-le", "surrogatepass"
+            )
+        else:
+            char_data = char_units.tobytes()
 
         # Count how many characters actually changed
         prev = last_chars[0]

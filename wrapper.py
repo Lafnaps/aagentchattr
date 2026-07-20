@@ -665,12 +665,18 @@ def _notify_recovery(data_dir: Path, agent_name: str):
         pass
 
 
-_IDENTITY_HINT = (
-    " (If this is a multi-instance session, reclaim your previous identity from "
-    "your context window, NOT from the chat history before responding. If you "
-    "didn't have one, tell the user to give you a name by clicking your status "
-    "pill at the top.)"
-)
+def _identity_hint(name: str) -> str:
+    """Bind first delivery to the wrapper's already-canonical identity.
+
+    Older prompts told a restarted multi-instance agent to reclaim a name from
+    conversational memory.  That can resurrect legacy aliases and detach the
+    live watcher from its durable canonical queue.  Registration/rename is the
+    control-plane authority; the model must not second-guess it.
+    """
+    return (
+        f" (Your current wrapper identity is @{name}; use that exact identity "
+        "and do not reclaim or emit a legacy alias.)"
+    )
 
 
 def _fetch_role_status(server_port: int, agent_name: str) -> tuple[bool, str]:
@@ -1675,7 +1681,7 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
 
                 identity_hint_added = False
                 if first_mention and is_multi_instance:
-                    prompt += _IDENTITY_HINT
+                    prompt += _identity_hint(name0)
                     identity_hint_added = True
 
                 # H5: identity must still be the captured generation right
@@ -1942,10 +1948,11 @@ def main():
             proxy.agent_name = current_name
             proxy.token = current_token
         if changed:
-            if new_name and new_name != old_name:
-                print(f"  Identity updated: {old_name} -> {new_name}")
-            if new_token and new_token != old_token:
-                print(f"  Session refreshed for @{current_name}")
+            # Do not print identity/session refreshes while the child TUI owns
+            # this console.  A normal print lands on the Claude composer row,
+            # looks like operator input to the fail-closed admission guard,
+            # and can permanently strand the canonical queue.  The registry
+            # and rename events already provide the authoritative audit trail.
             _rewrite_mcp_config(current_name, current_token)
 
         return changed

@@ -1048,6 +1048,13 @@ def _normalize_activity_screen(screen: str, provider: str) -> str:
     if state != "empty" or row < 0:
         return screen
     lines = screen.split("\n")
+    # id4083/id4139 D1: the composer row index comes from splitlines(); when
+    # the screen carries splitlines-only breaks (U+2028/U+2029/U+0085/\v/\f
+    # in transcript content) the two representations diverge and blanking
+    # could hit the wrong row — erasing real status while keeping the rotating
+    # suggestion. Fail closed: keep the raw screen (counts as real activity).
+    if len(lines) != len(screen.splitlines()):
+        return screen
     if row >= len(lines):
         return screen
     lines[row] = " " * len(lines[row])

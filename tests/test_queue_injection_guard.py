@@ -305,6 +305,21 @@ class AdmissionGuardTests(unittest.TestCase):
         ])
         self.assertEqual(normalize(draft, "claude"), draft)
 
+    def test_activity_normalization_fails_closed_on_splitlines_divergence(self):
+        # id4083/id4139 D1: U+2028 in a transcript cell makes splitlines()
+        # and split("\n") disagree; the splitlines() composer row index would
+        # blank the wrong split("\n") row — erasing the real status line while
+        # keeping the rotating suggestion. The guard must keep the raw screen.
+        normalize = wrapper_windows._normalize_activity_screen
+        screen = "\n".join([
+            "transcript with embedded line separator".ljust(80),
+            f'❯{NBSP}Try "fix lint errors"'.ljust(80),
+            "real status row".ljust(80),
+        ])
+        normalized = normalize(screen, "claude")
+        self.assertEqual(normalized, screen)
+        self.assertIn("real status row", normalized)
+
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only injection gate")
 class TypedTextVisibleTests(unittest.TestCase):

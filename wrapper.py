@@ -33,9 +33,11 @@ from pathlib import Path
 from delivery_io import (
     DeliveryBackpressureError,
     append_bytes_durable,
+    delivery_fence_exists,
     fsync_directory_best_effort,
     queue_consumer_lease,
     queue_file_lock,
+    require_delivery_fence_clear,
     write_unique_evidence,
     write_backpressure_marker,
 )
@@ -994,8 +996,11 @@ def _write_delivery_block_marker(queue_file: Path, error: str,
 
 
 def _delivery_is_blocked(queue_file: Path) -> bool:
-    """Marker existence alone is authoritative, even if its JSON is torn."""
-    return _delivery_block_marker_path(queue_file).exists()
+    """Either marker name is authoritative, even if its JSON is torn."""
+    return (
+        _delivery_block_marker_path(queue_file).exists()
+        or delivery_fence_exists(queue_file)
+    )
 
 
 def _valid_delivery_id(value) -> bool:
@@ -1192,6 +1197,7 @@ def _append_delivery_transition(queue_file: Path, state: str,
         record, ensure_ascii=True, sort_keys=True, separators=(",", ":")
     ) + "\n").encode("utf-8")
     with queue_file_lock(queue_file):
+        require_delivery_fence_clear(queue_file)
         current_size = path.stat().st_size if path.exists() else 0
         if current_size + len(encoded) > _MAX_DELIVERY_JOURNAL_BYTES:
             marker = write_backpressure_marker(

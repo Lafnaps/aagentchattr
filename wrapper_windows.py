@@ -433,7 +433,7 @@ def _make_admitted_injector(*, delay: float = 0.3,
             return 0.0
         return max(0.0, next_probe_at - clock())
 
-    def _enter_blocked_episode(result: dict) -> None:
+    def _enter_blocked_episode(result: dict, *, operator_alert: bool = True) -> None:
         nonlocal blocked_episode, episode_fingerprint
         if blocked_episode:
             return
@@ -444,7 +444,8 @@ def _make_admitted_injector(*, delay: float = 0.3,
         if emit:
             # This is the single operator-facing notification for the
             # cancellation/error episode.
-            emit(event)
+            if operator_alert:
+                emit(event)
             # The wrapper callback deliberately treats this second record as
             # audit-only.  It proves the bounded watchdog was armed without
             # creating another chat message.
@@ -524,8 +525,11 @@ def _make_admitted_injector(*, delay: float = 0.3,
                 composer_guard.should_alert(classification)
                 if composer_guard is not None else True
             )
-            if emit and should_alert:
-                emit(result["event"])
+            # A busy/unsafe composer is a recovery episode too.  Without this
+            # transition the watcher retries every poll and appends an
+            # attempting/retry pair each second until the durable journal
+            # reaches its fail-closed limit.
+            _enter_blocked_episode(result, operator_alert=should_alert)
             return status
         if status in ("cancelled", "error"):
             # Both outcomes may leave text in the composer.  They therefore

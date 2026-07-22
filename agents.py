@@ -12,6 +12,7 @@ from delivery_io import (
     DeliveryBackpressureError,
     append_bytes_durable,
     queue_file_lock,
+    require_delivery_fence_clear,
     write_backpressure_marker,
 )
 
@@ -125,6 +126,7 @@ class AgentTrigger:
         queue_file = self._data_dir / f"{agent_name}_queue.jsonl"
         self._data_dir.mkdir(parents=True, exist_ok=True)
         with queue_file_lock(queue_file):
+            require_delivery_fence_clear(queue_file)
             action_id = entry.get("action_id")
             if (
                 isinstance(action_id, str)

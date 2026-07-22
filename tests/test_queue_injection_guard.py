@@ -645,29 +645,54 @@ class InjectAttemptTests(unittest.TestCase):
             "injected-uncertain",
         )
 
-    def test_admitted_injector_dedupes_alert_set_per_episode(self):
+    def test_deferred_episode_backs_off_until_stable_empty_recovery(self):
         guard = wrapper_windows._ComposerAdmissionGuard("codex")
         events = []
+        now = [0.0]
         injector = wrapper_windows._make_admitted_injector(
-            composer_guard=guard, emit=events.append
+            composer_guard=guard,
+            emit=events.append,
+            monotonic=lambda: now[0],
         )
-        nonempty = _codex_screen_with_text("manual draft")
-        busy_a = CODEX_IDLE.replace("2m 10s", "2m 11s")
-        screens = [nonempty, busy_a, nonempty, nonempty]
+        deferred = {
+            "status": "deferred",
+            "classification": "busy",
+            "event": {
+                "action": "injection-deferred",
+                "classification": "busy",
+                "fingerprint": "busy-episode",
+            },
+        }
         with (
             mock.patch.object(
+                wrapper_windows, "_injection_attempt",
+                side_effect=[deferred, {"status": "injected"}],
+            ) as attempt,
+            mock.patch.object(
                 wrapper_windows, "_read_visible_console_text",
-                side_effect=screens,
-            ),
-            mock.patch.object(wrapper_windows.time, "sleep"),
+                side_effect=[CODEX_IDLE, CODEX_IDLE],
+            ) as read_screen,
         ):
-            for _ in screens:
-                self.assertEqual(injector("task"), "deferred")
-        deferred = [e for e in events if e["action"] == "injection-deferred"]
-        classifications = [e["classification"] for e in deferred]
-        # A,B,A,A pattern -> each classification alerted exactly once.
+            self.assertEqual(injector("task"), "deferred")
+            self.assertEqual(injector.retry_after(), 2.0)
+
+            now[0] = 1.0
+            self.assertEqual(injector("task"), "deferred")
+            self.assertEqual(attempt.call_count, 1)
+            self.assertEqual(read_screen.call_count, 0)
+
+            # Two due stable-empty sightings re-arm one actual attempt.
+            now[0] = 2.0
+            self.assertEqual(injector("task"), "deferred")
+            self.assertEqual(injector.retry_after(), 4.0)
+            now[0] = 6.0
+            self.assertEqual(injector("task"), "injected")
+            self.assertEqual(attempt.call_count, 2)
+            self.assertEqual(read_screen.call_count, 2)
+
         self.assertEqual(
-            sorted(classifications), ["busy", "nonempty-composer"]
+            [event["action"] for event in events],
+            ["injection-deferred", "injection-recovery-watchdog"],
         )
 
     def test_cancelled_and_error_episodes_alert_once_probe_and_rearm(self):
@@ -1487,6 +1512,7 @@ class WatcherDurabilityTests(unittest.TestCase):
 class RunAgentWiringTests(unittest.TestCase):
     def test_admission_guard_wires_single_attempt_injector(self):
         captured = {}
+        now = [0.0]
 
         class FinishedProcess:
             pid = 999
@@ -1506,6 +1532,11 @@ class RunAgentWiringTests(unittest.TestCase):
                     "Popen",
                     return_value=FinishedProcess(),
                 ),
+                mock.patch.object(
+                    wrapper_windows.time,
+                    "monotonic",
+                    side_effect=lambda: now[0],
+                ),
             ):
                 wrapper_windows.run_agent(
                     command=r"C:\bin\codex.exe",
@@ -1523,7 +1554,8 @@ class RunAgentWiringTests(unittest.TestCase):
             text = "use mcp to read #lane-test1 - task"
             screens = iter([
                 CODEX_IDLE,                     # attempt 1: stability read 1
-                CODEX_IDLE,                     # attempt 2: stable -> admit
+                CODEX_IDLE,                     # due recovery: sighting 2
+                CODEX_IDLE,                     # re-armed attempt preflight
                 _codex_screen_with_text(text),  # post-type preflight
             ])
             calls = []
@@ -1544,6 +1576,7 @@ class RunAgentWiringTests(unittest.TestCase):
                 mock.patch.object(wrapper_windows.time, "sleep"),
             ):
                 self.assertEqual(captured["inject"](text), "deferred")
+                now[0] = 2.0
                 self.assertEqual(captured["inject"](text), "injected")
             self.assertTrue(calls)
 

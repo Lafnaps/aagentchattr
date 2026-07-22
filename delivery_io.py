@@ -19,38 +19,56 @@ class DeliveryBackpressureError(RuntimeError):
     """Durable delivery storage reached its fail-closed safety ceiling."""
 
 
+def backpressure_marker_path(queue_file: Path) -> Path:
+    """Return the single authoritative fence for one delivery queue."""
+    queue_file = Path(queue_file)
+    return queue_file.with_name(queue_file.name + ".backpressure.json")
+
+
+def delivery_fence_exists(queue_file: Path) -> bool:
+    """Marker existence alone fences producers and consumers."""
+    return backpressure_marker_path(queue_file).exists()
+
+
+def require_delivery_fence_clear(queue_file: Path) -> None:
+    marker = backpressure_marker_path(queue_file)
+    if marker.exists():
+        raise DeliveryBackpressureError(
+            f"delivery is fenced by {marker.name}; explicit reconciliation required"
+        )
+
+
 def write_backpressure_marker(queue_file: Path, component: str,
                               current_bytes: int, limit_bytes: int) -> Path:
-    """Publish an actionable durable marker without deleting queue data."""
+    """Create one durable incident marker and never rewrite it."""
     queue_file = Path(queue_file)
-    marker = queue_file.with_name(queue_file.name + ".backpressure.json")
-    payload = json.dumps({
+    marker = backpressure_marker_path(queue_file)
+    payload = (json.dumps({
         "version": 1,
         "state": "delivery-backpressure",
         "component": str(component),
-        "queue": str(queue_file.resolve()),
+        "queue": queue_file.name,
         "current_bytes": int(current_bytes),
         "limit_bytes": int(limit_bytes),
         "at_ns": time.time_ns(),
         "action": (
             "manual reconciliation/archival required; no data was deleted"
         ),
-    }, ensure_ascii=True, sort_keys=True).encode("utf-8")
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=marker.name + ".tmp-", dir=str(marker.parent)
-    )
+    }, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(marker), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return marker
     try:
         with os.fdopen(fd, "wb") as stream:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(tmp_name, marker)
         fsync_directory_best_effort(marker.parent)
     except Exception:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
+        # The final marker name is already the authoritative fail-closed
+        # fence.  Never remove or rewrite it after a partial publication.
         raise
     return marker
 

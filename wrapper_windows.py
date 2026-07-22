@@ -250,7 +250,9 @@ def _injection_attempt(text: str, *, delay: float = 0.3,
         elif safeguard_guard and _screen_blocks_safeguard_input(screen):
             exact_classification = _classify_fable_safeguard_screen(screen)
             classification = (
-                exact_classification or "pointer-like"
+                "capacity"
+                if _classify_fable_capacity_screen(screen) is not None
+                else exact_classification or "pointer-like"
             )
             if composer_guard is not None:
                 composer_guard.reset_stability()
@@ -308,8 +310,10 @@ def _injection_attempt(text: str, *, delay: float = 0.3,
             "status": "cancelled",
             "event": {
                 "action": "injection-enter-cancelled",
-                "classification": _classify_fable_safeguard_screen(
-                    cancelled_screen
+                "classification": (
+                    "capacity"
+                    if _classify_fable_capacity_screen(cancelled_screen) is not None
+                    else _classify_fable_safeguard_screen(cancelled_screen)
                 ),
                 "fingerprint": _safeguard_screen_fingerprint(
                     cancelled_screen
@@ -351,7 +355,9 @@ def _probe_injection_admission(*, safeguard_guard: bool,
                 composer_guard.reset_stability()
         elif safeguard_guard and _screen_blocks_safeguard_input(screen):
             classification = (
-                _classify_fable_safeguard_screen(screen) or "pointer-like"
+                "capacity"
+                if _classify_fable_capacity_screen(screen) is not None
+                else _classify_fable_safeguard_screen(screen) or "pointer-like"
             )
             if composer_guard is not None:
                 composer_guard.reset_stability()
@@ -761,6 +767,32 @@ _FABLE_SAFEGUARD_PARAGRAPH = (
 )
 _FABLE_SAFEGUARD_OPTION_1 = "1. Switch to Opus 4.8"
 _FABLE_SAFEGUARD_OPTION_2 = "2. Edit prompt and retry with Fable 5"
+_FABLE_CAPACITY_LINE = re.compile(
+    r"^(?:"
+    r"You(?:'|\u2019)ve reached your (?:Fable|weekly Fable) limit"
+    r"(?: \u00b7 resets tomorrow)?"
+    r"|(?:\u26a0\s*)?Selected model is at capacity\. "
+    r"Please try a different model\."
+    r")$"
+)
+_FABLE_LEGACY_ALIASES = frozenset({
+    "fable-main",
+    "fable-infra",
+    "fable-emu",
+    "fable-work",
+    "fable-review",
+})
+
+
+def _is_fable_lane(agent: str) -> bool:
+    """Return true only for canonical Fable lanes or legacy input aliases."""
+    return bool(
+        re.fullmatch(
+            r"claude(?:-(?:test[123]|work))?-fable(?:-\d+)?",
+            agent or "",
+        )
+        or agent in _FABLE_LEGACY_ALIASES
+    )
 
 
 def _normalize_screen_text(text: str) -> str:
@@ -860,6 +892,7 @@ def _screen_may_accept_safeguard_choice(text: str) -> bool:
 def _screen_blocks_safeguard_input(text: str) -> bool:
     return bool(
         _classify_fable_safeguard_screen(text) is not None
+        or _classify_fable_capacity_screen(text) is not None
         or _screen_may_accept_safeguard_choice(text)
     )
 
@@ -895,6 +928,65 @@ def _classify_fable_safeguard_screen(text: str) -> str | None:
         and _extract_exact_safeguard_region(text, 1) is not None
     )
     return "strict" if strict else "ambiguous"
+
+
+def _extract_exact_capacity_region(text: str) -> str | None:
+    """Return a low, provider-shaped Fable capacity notice or ``None``.
+
+    A matching phrase in old transcript text is insufficient: the notice must
+    be close to a positively recognized empty Claude composer.  This mirrors
+    the safeguard menu's low-viewport binding and prevents a quoted notice or
+    an operator draft from becoming a machine event.
+    """
+    profile = _COMPOSER_PROFILES["claude"]
+    state, _content, composer_row = _composer_state(
+        text,
+        tuple(profile["markers"]),
+        tuple(profile["placeholders"]),
+        profile["separator"],
+        bool(profile["empty_requires_separator"]),
+    )
+    if state != "empty" or composer_row < 0:
+        return None
+    lines = _screen_lines(text)
+    first_row = max(0, composer_row - 8)
+    for index in range(composer_row - 1, first_row - 1, -1):
+        first = lines[index]
+        if not first.startswith((
+            "You've reached your ",
+            "You’ve reached your ",
+            "Selected model is at capacity.",
+            "⚠ Selected model is at capacity.",
+            "⚠Selected model is at capacity.",
+        )):
+            continue
+        # A nearby assistant/user lead-in makes the matching words transcript,
+        # not provider chrome. Exact isolated provider rows remain admissible.
+        previous = lines[index - 1] if index > 0 else ""
+        if (
+            previous.startswith(("✻", "●", "⏺", "Assistant:", "User:"))
+            or previous.endswith(":")
+        ):
+            continue
+        fragments = [first]
+        for continuation in lines[index + 1:min(composer_row, index + 4)]:
+            if not continuation or continuation.startswith(("╭", "┌", "❯", ">")):
+                break
+            fragments.append(continuation)
+        region = _normalize_screen_text("\n".join(fragments))
+        if _FABLE_CAPACITY_LINE.fullmatch(region):
+            return region
+    return None
+
+
+def _classify_fable_capacity_screen(text: str) -> str | None:
+    """Return ``strict`` only for an active low Fable capacity notice."""
+    return "strict" if _extract_exact_capacity_region(text) is not None else None
+
+
+def _capacity_screen_fingerprint(text: str) -> str:
+    region = _extract_exact_capacity_region(text) or ""
+    return hashlib.sha256(region.encode("utf-8")).hexdigest()[:16]
 
 
 def _is_second_safeguard_option_selected(text: str) -> bool:
@@ -1324,6 +1416,46 @@ class _SafeguardRetryController:
         self.clean_hits = 0
         self.escalated_episode = False
         self.ambiguous_episode_reported = False
+        self.capacity_visible_fingerprint = None
+        self.capacity_candidate_fingerprint = None
+        self.capacity_candidate_hits = 0
+        self.capacity_clean_hits = 0
+
+    def _observe_capacity(self, screen_text: str):
+        classification = _classify_fable_capacity_screen(screen_text)
+        if classification is None:
+            self.capacity_clean_hits += 1
+            self.capacity_candidate_fingerprint = None
+            self.capacity_candidate_hits = 0
+            if self.capacity_clean_hits >= 2:
+                self.capacity_visible_fingerprint = None
+            return None
+        self.capacity_clean_hits = 0
+        fingerprint = _capacity_screen_fingerprint(screen_text)
+        if fingerprint == self.capacity_visible_fingerprint:
+            return None
+        if fingerprint != self.capacity_candidate_fingerprint:
+            self.capacity_candidate_fingerprint = fingerprint
+            self.capacity_candidate_hits = 1
+            return None
+        self.capacity_candidate_hits += 1
+        if self.capacity_candidate_hits < self.stable_polls:
+            return None
+        # Do not commit dedupe state until the monitor confirms delivery. A
+        # transient callback failure therefore retries the same visible event.
+        self.capacity_candidate_hits = self.stable_polls
+        return {
+            "action": "capacity",
+            "category": "fable_limit",
+            "fingerprint": fingerprint,
+        }
+
+    def confirm_capacity_delivery(self, fingerprint: str):
+        if fingerprint != self.capacity_candidate_fingerprint:
+            return
+        self.capacity_visible_fingerprint = fingerprint
+        self.capacity_candidate_fingerprint = None
+        self.capacity_candidate_hits = 0
 
     def observe(self, screen_text: str, pid: int | None):
         if pid != self.pid:
@@ -1335,6 +1467,12 @@ class _SafeguardRetryController:
             self.clean_hits = 0
             self.escalated_episode = False
             self.ambiguous_episode_reported = False
+            self.capacity_visible_fingerprint = None
+            self.capacity_candidate_fingerprint = None
+            self.capacity_candidate_hits = 0
+            self.capacity_clean_hits = 0
+
+        capacity_decision = self._observe_capacity(screen_text)
 
         classification = _classify_fable_safeguard_screen(screen_text)
         if classification is None:
@@ -1345,7 +1483,7 @@ class _SafeguardRetryController:
                 self.candidate_hits = 0
                 self.escalated_episode = False
                 self.ambiguous_episode_reported = False
-            return None
+            return capacity_decision
         self.clean_hits = 0
 
         fingerprint = _safeguard_screen_fingerprint(screen_text)
@@ -1405,15 +1543,21 @@ def _make_safeguard_emitter(*, agent: str, pid_holder, queue_file: Path,
     def emit(event):
         pid = pid_holder[0] if pid_holder is not None else None
         payload = {"agent": agent, "pid": pid, **event}
+        audit_ok = False
         try:
             _append_safeguard_audit(audit_path, payload)
+            audit_ok = True
         except Exception:
             pass
         if event_callback:
             try:
-                event_callback(payload)
+                callback_result = event_callback(payload)
             except Exception:
-                pass
+                return False
+            # Existing callbacks returning None remain successful; the wrapper
+            # callback now returns an explicit bool for capacity delivery.
+            return callback_result is not False
+        return audit_ok
 
     return emit
 
@@ -1423,9 +1567,14 @@ def _start_safeguard_monitor(*, agent: str, pid_holder, queue_file: Path,
                              enter_backend: str, event_callback=None,
                              event_sink=None, poll_seconds: float = 0.5,
                              stop_event=None):
-    if not enabled or not agent.startswith("fable-"):
+    if not _is_fable_lane(agent):
         return None
-    controller = _SafeguardRetryController(max_retries=max_retries)
+    # Capacity observation remains live when automatic safeguard-menu retry is
+    # disabled. That rollback mode suppresses all safeguard-menu decisions and
+    # can never select a menu option.
+    controller = _SafeguardRetryController(
+        max_retries=max_retries if enabled else 0
+    )
     emit = event_sink or _make_safeguard_emitter(
         agent=agent,
         pid_holder=pid_holder,
@@ -1451,7 +1600,12 @@ def _start_safeguard_monitor(*, agent: str, pid_holder, queue_file: Path,
                 decision = controller.observe(screen, int(pid))
                 if not decision:
                     continue
-                if decision["action"] == "retry":
+                if not enabled and decision["action"] != "capacity":
+                    # Rollback mode observes capacity only: safeguard menus are
+                    # still blocked by injection admission, but never alert,
+                    # escalate, or receive monitor input.
+                    continue
+                if decision["action"] == "retry" and enabled:
                     # Re-read immediately before input; any redraw/wording
                     # change converts the action into a harmless audit event.
                     if _classify_fable_safeguard_screen(
@@ -1468,7 +1622,11 @@ def _start_safeguard_monitor(*, agent: str, pid_holder, queue_file: Path,
                         # Enter or retry from an unknown pointer position.
                         emit({**decision, "action": "selection-cancelled"})
                         continue
-                emit(decision)
+                delivered = emit(decision)
+                if decision["action"] == "capacity" and delivered is not False:
+                    controller.confirm_capacity_delivery(
+                        decision["fingerprint"]
+                    )
             except Exception as exc:
                 # A Win32/input failure must not silently kill the only
                 # safeguard monitor.  Alert without logging prompt text and
@@ -1672,7 +1830,7 @@ def run_agent(command, extra_args, cwd, env, queue_file, agent, no_restart, star
         env = {**env, **inject_env}
     # Queue-triggered Enter must be guarded for every Fable session, even when
     # automatic option selection is disabled as a rollback measure.
-    safeguard_guard_enabled = agent.startswith("fable-")
+    safeguard_guard_enabled = _is_fable_lane(agent)
     safeguard_monitor_enabled = bool(
         safeguard_auto_retry and safeguard_guard_enabled
     )

@@ -79,6 +79,19 @@ we're working to refine them. Send feedback with /feedback or learn more
   2. Edit prompt and retry with Fable 5
 """
 
+CAPACITY_SCREEN = "\n".join([
+    "You've reached your Fable limit · resets tomorrow",
+    "",
+    "╭──────────────────────────────────────╮",
+    f"│ ❯{NBSP}",
+    "╰──────────────────────────────────────╯",
+    "  ⏵⏵ bypass permissions on",
+])
+CAPACITY_SELECTED_SCREEN = CAPACITY_SCREEN.replace(
+    "You've reached your Fable limit · resets tomorrow",
+    "⚠ Selected model is at capacity.\nPlease try a different model.",
+)
+
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only injection gate")
 class ComposerStateTests(unittest.TestCase):
@@ -522,6 +535,18 @@ class InjectAttemptTests(unittest.TestCase):
         self.assertEqual(result["status"], "deferred")
         self.assertEqual(result["classification"], "strict")
         self.assertEqual(calls, [])
+
+    def test_capacity_notice_defers_without_any_input(self):
+        for screen in (CAPACITY_SCREEN, CAPACITY_SELECTED_SCREEN):
+            with self.subTest(screen=screen.splitlines()[0]):
+                guard = wrapper_windows._ComposerAdmissionGuard("claude")
+                calls = []
+                result = self._attempt(
+                    "task", [screen], guard, calls, safeguard_guard=True
+                )
+                self.assertEqual(result["status"], "deferred")
+                self.assertEqual(result["classification"], "capacity")
+                self.assertEqual(calls, [])
 
     def test_stable_empty_composer_single_batch_single_enter(self):
         text = "use mcp to read #lane-test1 - task"
@@ -1521,6 +1546,52 @@ class RunAgentWiringTests(unittest.TestCase):
                 self.assertEqual(captured["inject"](text), "deferred")
                 self.assertEqual(captured["inject"](text), "injected")
             self.assertTrue(calls)
+
+    def test_canonical_fable_wires_guard_and_capacity_monitor_when_retry_off(self):
+        captured = {}
+
+        class FinishedProcess:
+            pid = 1001
+            returncode = 0
+
+            @staticmethod
+            def wait():
+                return None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(wrapper_windows, "enable_vt_mode"),
+                mock.patch.object(wrapper_windows, "_vt_keepalive_thread"),
+                mock.patch.object(
+                    wrapper_windows, "_start_safeguard_monitor"
+                ) as monitor,
+                mock.patch.object(
+                    wrapper_windows.subprocess,
+                    "Popen",
+                    return_value=FinishedProcess(),
+                ),
+            ):
+                wrapper_windows.run_agent(
+                    command=r"C:\bin\claude.exe",
+                    extra_args=[],
+                    cwd=temp_dir,
+                    env={},
+                    queue_file=Path(temp_dir) / "queue.jsonl",
+                    agent="claude-test1-fable",
+                    no_restart=True,
+                    start_watcher=lambda fn: captured.setdefault("inject", fn),
+                    pid_holder=[None],
+                    safeguard_auto_retry=False,
+                    injection_admission_guard=True,
+                    composer_provider="claude",
+                )
+
+        self.assertIn("inject", captured)
+        monitor.assert_called_once()
+        kwargs = monitor.call_args.kwargs
+        self.assertEqual(kwargs["agent"], "claude-test1-fable")
+        self.assertFalse(kwargs["enabled"])
+        self.assertIsNotNone(kwargs["event_sink"])
 
 
 if __name__ == "__main__":

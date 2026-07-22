@@ -1804,6 +1804,24 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
 # Main
 # ---------------------------------------------------------------------------
 
+
+def _format_capacity_machine_event(event: dict) -> str | None:
+    """Return the exact sanitized dispatcher marker for a capacity event."""
+    if event.get("action") != "capacity":
+        return None
+    if event.get("category") != "fable_limit":
+        return None
+    fingerprint = event.get("fingerprint")
+    if not isinstance(fingerprint, str) or not re.fullmatch(
+        r"[0-9a-f]{16}", fingerprint
+    ):
+        return None
+    return (
+        "DISPATCH_PROVIDER_STATE state=CAPACITY model=fable "
+        f"reason=provider_limit fingerprint={fingerprint}"
+    )
+
+
 def main():
     import argparse
     import urllib.error
@@ -2177,7 +2195,7 @@ def main():
             if action == "injection-recovery-watchdog":
                 # _make_safeguard_emitter already persisted this event.  It is
                 # intentionally audit-only: never post it to chat.
-                return
+                return True
             attempt = event.get("attempt", 0)
             fingerprint = event.get("fingerprint", "unknown")
             current_name, _ = get_identity()
@@ -2217,6 +2235,10 @@ def main():
                     f"monitor recovered from {error_type}; no model switch "
                     f"was attempted. Manual screen review is required."
                 )
+            elif action == "capacity":
+                text = _format_capacity_machine_event(event)
+                if text is None:
+                    return False
             elif action == "injection-deferred":
                 classification = event.get("classification", "unknown")
                 text = (
@@ -2248,7 +2270,7 @@ def main():
                     f"and manual composer review is required."
                 )
             else:
-                return
+                return True
             body = json.dumps({"text": text, "channel": "general"}).encode()
             req = urllib.request.Request(
                 f"http://127.0.0.1:{server_port}/api/send",
@@ -2258,6 +2280,7 @@ def main():
             )
             with urllib.request.urlopen(req, timeout=5):
                 pass
+            return True
 
         run_kwargs["safeguard_event_callback"] = _report_safeguard_event
     if sys.platform != "win32":

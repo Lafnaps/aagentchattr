@@ -5,6 +5,7 @@ import threading
 import unittest
 from unittest import mock
 
+import wrapper
 import wrapper_windows
 
 
@@ -26,6 +27,43 @@ MENU_SECOND = MENU.replace(
 ).replace(
     "  2. Edit prompt and retry with Fable 5",
     "❯ 2. Edit prompt and retry with Fable 5",
+)
+
+NBSP = " "
+CAPACITY = "\n".join([
+    "You've reached your Fable limit · resets tomorrow",
+    "",
+    "╭──────────────────────────────────────╮",
+    f"│ ❯{NBSP}",
+    "╰──────────────────────────────────────╯",
+    "  ⏵⏵ bypass permissions on",
+])
+CAPACITY_WRAPPED = "\n".join([
+    "You’ve reached your weekly Fable",
+    "limit · resets tomorrow",
+    "",
+    "╭──────────────────────────────────────╮",
+    f"│ ❯{NBSP}",
+    "╰──────────────────────────────────────╯",
+])
+CAPACITY_SELECTED = "\n".join([
+    "Selected model is at capacity. Please try a different model.",
+    "",
+    "╭──────────────────────────────────────╮",
+    f"│ ❯{NBSP}",
+    "╰──────────────────────────────────────╯",
+])
+CAPACITY_SELECTED_WRAPPED = CAPACITY_SELECTED.replace(
+    "Selected model is at capacity. Please try a different model.",
+    "Selected model is at capacity.\nPlease try a different model.",
+)
+CAPACITY_SELECTED_WARNING = CAPACITY_SELECTED.replace(
+    "Selected model is at capacity.",
+    "⚠ Selected model is at capacity.",
+)
+CAPACITY_SELECTED_WARNING_WRAPPED = CAPACITY_SELECTED_WRAPPED.replace(
+    "Selected model is at capacity.",
+    "⚠ Selected model is at capacity.",
 )
 
 
@@ -100,6 +138,86 @@ Fable 5's safeguards flagged this message.
             "ambiguous",
         )
 
+    def test_low_capacity_notice_with_empty_composer_is_strict(self):
+        self.assertEqual(
+            wrapper_windows._classify_fable_capacity_screen(CAPACITY),
+            "strict",
+        )
+
+    def test_curly_apostrophe_wrapped_capacity_notice_is_strict(self):
+        self.assertEqual(
+            wrapper_windows._classify_fable_capacity_screen(CAPACITY_WRAPPED),
+            "strict",
+        )
+
+    def test_selected_model_capacity_exact_wrapped_and_warning_are_strict(self):
+        for screen in (
+            CAPACITY_SELECTED,
+            CAPACITY_SELECTED_WRAPPED,
+            CAPACITY_SELECTED_WARNING,
+            CAPACITY_SELECTED_WARNING_WRAPPED,
+        ):
+            self.assertEqual(
+                wrapper_windows._classify_fable_capacity_screen(screen),
+                "strict",
+            )
+
+    def test_arbitrary_named_limit_is_not_capacity(self):
+        for label in ("API", "x", "Opus"):
+            screen = CAPACITY.replace("Fable limit", f"{label} limit")
+            self.assertIsNone(
+                wrapper_windows._classify_fable_capacity_screen(screen)
+            )
+
+    def test_realistic_low_transcript_quote_is_not_capacity(self):
+        quoted = CAPACITY.replace(
+            "You've reached your Fable limit · resets tomorrow",
+            "✻ Here is the exact terminal text:\n"
+            "You've reached your Fable limit · resets tomorrow",
+        )
+        self.assertIsNone(
+            wrapper_windows._classify_fable_capacity_screen(quoted)
+        )
+
+    def test_capacity_phrase_in_operator_draft_is_not_capacity(self):
+        draft = CAPACITY.replace(
+            f"│ ❯{NBSP}",
+            f"│ ❯{NBSP}You've reached your Fable limit",
+        )
+        self.assertIsNone(
+            wrapper_windows._classify_fable_capacity_screen(draft)
+        )
+
+    def test_capacity_phrase_high_in_transcript_is_not_capacity(self):
+        quoted = CAPACITY.replace(
+            "You've reached your Fable limit · resets tomorrow\n",
+            "You've reached your Fable limit · resets tomorrow\n" + ("\n" * 10),
+        )
+        self.assertIsNone(
+            wrapper_windows._classify_fable_capacity_screen(quoted)
+        )
+
+    def test_canonical_fable_lane_recognition_is_bounded(self):
+        for name in (
+            "claude-fable",
+            "claude-test1-fable",
+            "claude-test2-fable",
+            "claude-test3-fable",
+            "claude-work-fable",
+            "claude-work-fable-1",
+            "fable-infra",
+        ):
+            self.assertTrue(wrapper_windows._is_fable_lane(name), name)
+        for name in (
+            "claude-opus",
+            "claude-test1-opus",
+            "claude-fable-extra",
+            "claude-work-fable-1-extra",
+            "not-claude-fable",
+            "fable-arbitrary",
+        ):
+            self.assertFalse(wrapper_windows._is_fable_lane(name), name)
+
 
 class SafeguardRetryControllerTests(unittest.TestCase):
     def setUp(self):
@@ -153,6 +271,49 @@ class SafeguardRetryControllerTests(unittest.TestCase):
     def test_new_child_pid_resets_budget(self):
         self.assertEqual(self._stable(pid=101)["attempt"], 1)
         self.assertEqual(self._stable(pid=202)["attempt"], 1)
+
+    def test_capacity_emits_once_after_two_stable_polls(self):
+        self.assertIsNone(self.controller.observe(CAPACITY, 101))
+        decision = self.controller.observe(CAPACITY, 101)
+        self.assertEqual(decision["action"], "capacity")
+        self.assertEqual(decision["category"], "fable_limit")
+        self.assertRegex(decision["fingerprint"], r"^[0-9a-f]{16}$")
+        self.controller.confirm_capacity_delivery(decision["fingerprint"])
+        self.assertIsNone(self.controller.observe(CAPACITY, 101))
+
+    def test_capacity_rearms_after_two_clean_polls_and_new_pid(self):
+        self.assertIsNone(self.controller.observe(CAPACITY, 101))
+        decision = self.controller.observe(CAPACITY, 101)
+        self.assertEqual(decision["action"], "capacity")
+        self.controller.confirm_capacity_delivery(decision["fingerprint"])
+        self.assertIsNone(self.controller.observe("ordinary output", 101))
+        self.assertIsNone(self.controller.observe("ordinary output", 101))
+        self.assertIsNone(self.controller.observe(CAPACITY, 101))
+        decision = self.controller.observe(CAPACITY, 101)
+        self.assertEqual(decision["action"], "capacity")
+        self.controller.confirm_capacity_delivery(decision["fingerprint"])
+        self.assertIsNone(self.controller.observe(CAPACITY, 202))
+        decision = self.controller.observe(CAPACITY, 202)
+        self.assertEqual(decision["action"], "capacity")
+        self.controller.confirm_capacity_delivery(decision["fingerprint"])
+
+    def test_capacity_machine_event_is_exact_and_sanitized(self):
+        event = {
+            "action": "capacity",
+            "category": "fable_limit",
+            "fingerprint": "0123456789abcdef",
+            "agent": "claude-test1-fable",
+            "pid": 123,
+            "prompt": "must not leak",
+        }
+        self.assertEqual(
+            wrapper._format_capacity_machine_event(event),
+            "DISPATCH_PROVIDER_STATE state=CAPACITY model=fable "
+            "reason=provider_limit fingerprint=0123456789abcdef",
+        )
+        self.assertIsNone(wrapper._format_capacity_machine_event({
+            **event, "fingerprint": "not-a-fingerprint",
+        }))
 
     def test_ambiguous_menu_only_alerts_once(self):
         changed = MENU.replace("retry with Fable 5", "retry with Opus 4.8")
@@ -558,7 +719,7 @@ class SafeguardInputTests(unittest.TestCase):
             wrapper_windows, "_read_visible_console_text", side_effect=read_screen
         ):
             thread = wrapper_windows._start_safeguard_monitor(
-                agent="fable-test",
+                agent="claude-test1-fable",
                 pid_holder=[321],
                 queue_file=Path(temp_dir) / "queue.jsonl",
                 enabled=True,
@@ -575,6 +736,179 @@ class SafeguardInputTests(unittest.TestCase):
         errors = [event for event in events if event["action"] == "monitor-error"]
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0]["error_type"], "RuntimeError")
+
+    def test_emitter_reports_audit_and_callback_delivery_outcomes(self):
+        event = {"action": "capacity", "category": "fable_limit"}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            queue_file = Path(temp_dir) / "queue.jsonl"
+            callback = mock.Mock(side_effect=RuntimeError("chat down"))
+            emit = wrapper_windows._make_safeguard_emitter(
+                agent="claude-test1-fable",
+                pid_holder=[321],
+                queue_file=queue_file,
+                event_callback=callback,
+            )
+            self.assertFalse(emit(event))
+            audit_path = Path(temp_dir) / (
+                "claude-test1-fable_safeguard-retry.jsonl"
+            )
+            self.assertTrue(audit_path.is_file())
+
+            with mock.patch.object(
+                wrapper_windows,
+                "_append_safeguard_audit",
+                side_effect=OSError("audit down"),
+            ):
+                delivered = wrapper_windows._make_safeguard_emitter(
+                    agent="claude-test1-fable",
+                    pid_holder=[321],
+                    queue_file=queue_file,
+                    event_callback=lambda _event: True,
+                )
+                self.assertTrue(delivered(event))
+                audit_only = wrapper_windows._make_safeguard_emitter(
+                    agent="claude-test1-fable",
+                    pid_holder=[321],
+                    queue_file=queue_file,
+                )
+                self.assertFalse(audit_only(event))
+
+            audit_only = wrapper_windows._make_safeguard_emitter(
+                agent="claude-test1-fable",
+                pid_holder=[321],
+                queue_file=queue_file,
+            )
+            self.assertTrue(audit_only(event))
+
+    def test_persistent_capacity_retries_failed_callback_then_dedupes(self):
+        callbacks = []
+        stop = threading.Event()
+        reads = [0]
+
+        def read_screen():
+            reads[0] += 1
+            if reads[0] >= 5:
+                stop.set()
+            return CAPACITY_SELECTED_WARNING
+
+        def callback(event):
+            callbacks.append(event)
+            if len(callbacks) == 1:
+                raise RuntimeError("transient chat failure")
+            return True
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch.object(
+                wrapper_windows,
+                "_read_visible_console_text",
+                side_effect=read_screen,
+            ),
+            mock.patch.object(
+                wrapper_windows, "_select_second_menu_option"
+            ) as select_option,
+        ):
+            thread = wrapper_windows._start_safeguard_monitor(
+                agent="claude-work-fable-1",
+                pid_holder=[321],
+                queue_file=Path(temp_dir) / "queue.jsonl",
+                enabled=False,
+                max_retries=2,
+                enter_backend="console_input",
+                event_callback=callback,
+                poll_seconds=0.01,
+                stop_event=stop,
+            )
+            thread.join(timeout=2)
+            audit_path = Path(temp_dir) / (
+                "claude-work-fable-1_safeguard-retry.jsonl"
+            )
+            audit_lines = audit_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(callbacks), 2)
+        self.assertEqual([event["action"] for event in callbacks], [
+            "capacity", "capacity",
+        ])
+        self.assertEqual(len(audit_lines), 2)
+        select_option.assert_not_called()
+
+    def test_retry_off_monitor_ignores_safeguard_menu(self):
+        events = []
+        stop = threading.Event()
+        reads = [0]
+
+        def read_screen():
+            reads[0] += 1
+            if reads[0] >= 3:
+                stop.set()
+            return MENU
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch.object(
+                wrapper_windows,
+                "_read_visible_console_text",
+                side_effect=read_screen,
+            ),
+            mock.patch.object(
+                wrapper_windows, "_select_second_menu_option"
+            ) as select_option,
+        ):
+            thread = wrapper_windows._start_safeguard_monitor(
+                agent="claude-test1-fable",
+                pid_holder=[321],
+                queue_file=Path(temp_dir) / "queue.jsonl",
+                enabled=False,
+                max_retries=2,
+                enter_backend="console_input",
+                event_sink=events.append,
+                poll_seconds=0.01,
+                stop_event=stop,
+            )
+            thread.join(timeout=2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(events, [])
+        select_option.assert_not_called()
+
+    def test_canonical_capacity_monitor_emits_without_menu_input(self):
+        events = []
+        stop = threading.Event()
+        reads = [0]
+
+        def read_screen():
+            reads[0] += 1
+            if reads[0] >= 2:
+                stop.set()
+            return CAPACITY
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch.object(
+                wrapper_windows, "_read_visible_console_text",
+                side_effect=read_screen,
+            ),
+            mock.patch.object(
+                wrapper_windows, "_select_second_menu_option"
+            ) as select_option,
+        ):
+            thread = wrapper_windows._start_safeguard_monitor(
+                agent="claude-test1-fable",
+                pid_holder=[321],
+                queue_file=Path(temp_dir) / "queue.jsonl",
+                enabled=False,
+                max_retries=2,
+                enter_backend="console_input",
+                event_sink=events.append,
+                poll_seconds=0.01,
+                stop_event=stop,
+            )
+            thread.join(timeout=2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual([event["action"] for event in events], ["capacity"])
+        select_option.assert_not_called()
 
     def test_fable_queue_guard_stays_on_when_auto_retry_is_off(self):
         captured = {}
@@ -616,7 +950,7 @@ class SafeguardInputTests(unittest.TestCase):
                     cwd=temp_dir,
                     env={},
                     queue_file=queue_file,
-                    agent="fable-test",
+                    agent="claude-test1-fable",
                     no_restart=True,
                     start_watcher=start_watcher,
                     pid_holder=[None],

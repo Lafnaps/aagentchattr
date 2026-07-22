@@ -1,7 +1,7 @@
 @echo off
-REM agentchattr — starts server (if not running) + MiniMax API agent wrapper
-REM Usage: start_minimax.bat
-REM Requires MINIMAX_API_KEY environment variable.
+REM agentchattr - claude-test2-fable (Fable-EMU, OD-001) (account .claude-test2, WC V:\Programming\Projects\TradeStation-AI\test2)
+REM (was .claude-work in WC TradeStation until 2026-07-09; switched after token exhaustion)
+set "CLAUDE_CONFIG_DIR=C:\Users\A\.claude-test2"
 cd /d "%~dp0.."
 
 REM Auto-create venv and install deps on first run
@@ -11,12 +11,12 @@ if not exist ".venv" (
 )
 call .venv\Scripts\activate.bat
 
-REM Check API key
-if "%MINIMAX_API_KEY%"=="" (
+REM Pre-flight: check that claude CLI is installed
+where claude >nul 2>&1
+if %errorlevel% neq 0 (
     echo.
-    echo   Error: MINIMAX_API_KEY environment variable is not set.
-    echo   Get an API key at https://platform.minimax.io
-    echo   Then: set MINIMAX_API_KEY=your-key-here
+    echo   Error: "claude" was not found on PATH.
+    echo   Install it first, then try again.
     echo.
     pause
     exit /b 1
@@ -30,7 +30,7 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-python wrapper_api.py minimax
+python wrapper.py claude-test2-fable --dangerously-skip-permissions
 if %errorlevel% neq 0 (
     echo.
     echo   Agent exited unexpectedly. Check the output above.

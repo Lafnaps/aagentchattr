@@ -23,16 +23,12 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-REM Start server if not already running, then wait for it
-netstat -ano | findstr :8300 | findstr LISTENING >nul 2>&1
+REM Server is managed by the 'Agentchattr Server' Scheduled Task (R1):
+REM launchers are wait-only and never start the server themselves.
+call "%~dp0wait-for-server.bat"
 if %errorlevel% neq 0 (
-    start "agentchattr server" cmd /c "python run.py"
-)
-:wait_server
-netstat -ano | findstr :8300 | findstr LISTENING >nul 2>&1
-if %errorlevel% neq 0 (
-    timeout /t 1 /nobreak >nul
-    goto :wait_server
+    pause
+    exit /b 1
 )
 
 python wrapper.py copilot

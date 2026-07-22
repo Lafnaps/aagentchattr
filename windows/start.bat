@@ -1,15 +1,8 @@
 @echo off
-REM agentchattr — starts the server only
-cd /d "%~dp0.."
-
-REM Auto-create venv and install deps on first run
-if not exist ".venv" (
-    python -m venv .venv
-    .venv\Scripts\pip install -q -r requirements.txt >nul 2>nul
-)
-call .venv\Scripts\activate.bat
-
-python run.py
+REM agentchattr — server wait/status only (R1): the server itself is managed by
+REM the 'Agentchattr Server' Scheduled Task and is NEVER started from here.
+REM Install (staged Disabled): pwsh -File V:\Programming\Projects\AI\Infra\launchers\Install-AgentchattrServerTask.ps1
+call "%~dp0wait-for-server.bat"
 echo.
-echo === Server exited with code %ERRORLEVEL% ===
+echo === wait-for-server exited with code %ERRORLEVEL% ===
 pause

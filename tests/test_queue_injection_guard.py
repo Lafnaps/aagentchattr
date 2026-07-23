@@ -471,6 +471,43 @@ class TypedTextVisibleTests(unittest.TestCase):
                     )
                 )
 
+    def test_codex_cancelled_paste_pill_requires_exact_python_len(self):
+        guard = self._guard()
+        # Live F2 evidence: the flattened injected prompt had Python len 2303
+        # and Codex rendered exactly `[Pasted Content 2303 chars]`.
+        text = "x" * 2303
+        pill = "[Pasted Content 2303 chars]"
+        screen = _codex_screen_with_text(pill)
+        self.assertEqual(len(text), 2303)
+        self.assertEqual(
+            wrapper_windows._codex_cancelled_owned_paste_pill(
+                screen, text, guard
+            ),
+            pill,
+        )
+        # Generic exact ownership remains strict and never trusts the pill.
+        self.assertFalse(
+            wrapper_windows._owned_composer_text_is_exact(screen, text, guard)
+        )
+        for mutant in (
+            "[Pasted Content 2302 chars]",
+            "[Pasted Content 02303 chars]",
+            "[Pasted Content 2303 chars] operator draft",
+            "[Pasted content 2303 chars]",
+        ):
+            with self.subTest(mutant=mutant):
+                self.assertIsNone(
+                    wrapper_windows._codex_cancelled_owned_paste_pill(
+                        _codex_screen_with_text(mutant), text, guard
+                    )
+                )
+        claude_guard = self._guard(provider="claude")
+        self.assertIsNone(
+            wrapper_windows._codex_cancelled_owned_paste_pill(
+                _fable_screen_with_text(pill), text, claude_guard
+            )
+        )
+
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only injection gate")
 class InjectAttemptTests(unittest.TestCase):
@@ -981,6 +1018,300 @@ class InjectAttemptTests(unittest.TestCase):
             [call.args[0] for call in attempt.call_args_list],
             [old_text, new_text],
         )
+
+    def test_cancelled_codex_paste_pill_provenance_clears_after_two_probes(self):
+        text = "x" * 2303
+        pill_screen = _codex_screen_with_text(
+            "[Pasted Content 2303 chars]"
+        )
+        guard = wrapper_windows._ComposerAdmissionGuard("codex")
+
+        # Exercise the real cancellation result shape: the raw screen is a
+        # private top-level field and never enters the emitted event.
+        with (
+            mock.patch.object(
+                wrapper_windows,
+                "_read_visible_console_text",
+                side_effect=[CODEX_IDLE, pill_screen],
+            ),
+            mock.patch.object(
+                wrapper_windows, "_inject_unlocked", return_value=False
+            ),
+        ):
+            cancelled = wrapper_windows._injection_attempt(
+                text, composer_guard=guard, allow_active=True
+            )
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["_owned_cancelled_screen"], pill_screen)
+        self.assertNotIn("Pasted Content", json.dumps(cancelled["event"]))
+
+        now = [0.0]
+        injector = wrapper_windows._make_admitted_injector(
+            composer_guard=guard,
+            monotonic=lambda: now[0],
+        )
+        with (
+            mock.patch.object(
+                wrapper_windows,
+                "_injection_attempt",
+                side_effect=[cancelled, {"status": "injected"}],
+            ) as attempt,
+            mock.patch.object(
+                wrapper_windows,
+                "_read_visible_console_text",
+                side_effect=[pill_screen, pill_screen, CODEX_IDLE, CODEX_IDLE],
+            ),
+            mock.patch.object(
+                wrapper_windows.kernel32, "GetStdHandle", return_value=123
+            ),
+            mock.patch.object(wrapper_windows, "_write_key") as write_key,
+            mock.patch.object(wrapper_windows.time, "sleep"),
+        ):
+            self.assertEqual(injector(text), "cancelled")
+            now[0] = 2.0
+            self.assertEqual(injector(text), "deferred")
+            write_key.assert_not_called()
+            now[0] = 6.0
+            self.assertEqual(injector(text), "deferred")
+            self.assertEqual(write_key.call_count, 2)
+            now[0] = 14.0
+            self.assertEqual(injector(text), "injected")
+
+        self.assertEqual(attempt.call_count, 2)
+
+    def test_same_length_pill_without_immediate_cancel_provenance_is_rejected(self):
+        text = "x" * 2303
+        pill_screen = _codex_screen_with_text(
+            "[Pasted Content 2303 chars]"
+        )
+        for restarted in (False, True):
+            with self.subTest(restarted=restarted):
+                guard = wrapper_windows._ComposerAdmissionGuard("codex")
+                now = [0.0]
+                injector = wrapper_windows._make_admitted_injector(
+                    composer_guard=guard,
+                    monotonic=lambda: now[0],
+                )
+                initial = {
+                    "status": "deferred" if restarted else "cancelled",
+                    "classification": "nonempty-composer",
+                    "event": {
+                        "action": (
+                            "injection-deferred" if restarted
+                            else "injection-enter-cancelled"
+                        ),
+                        "fingerprint": "no-private-pill-proof",
+                    },
+                }
+                with (
+                    mock.patch.object(
+                        wrapper_windows,
+                        "_injection_attempt",
+                        return_value=initial,
+                    ) as attempt,
+                    mock.patch.object(
+                        wrapper_windows,
+                        "_read_visible_console_text",
+                        return_value=pill_screen,
+                    ),
+                    mock.patch.object(
+                        wrapper_windows, "_write_key"
+                    ) as write_key,
+                ):
+                    self.assertEqual(
+                        injector(text),
+                        "deferred" if restarted else "cancelled",
+                    )
+                    for due in (2.0, 6.0, 14.0):
+                        now[0] = due
+                        self.assertEqual(injector(text), "deferred")
+
+                self.assertEqual(attempt.call_count, 1)
+                write_key.assert_not_called()
+
+    def test_unmatched_or_other_provider_paste_pill_never_arms(self):
+        text = "x" * 2303
+        cases = (
+            (
+                wrapper_windows._ComposerAdmissionGuard("codex"),
+                _codex_screen_with_text("[Pasted Content 2304 chars]"),
+            ),
+            (
+                wrapper_windows._ComposerAdmissionGuard("codex"),
+                _codex_screen_with_text(
+                    "[Pasted Content 2303 chars] operator draft"
+                ),
+            ),
+            (
+                wrapper_windows._ComposerAdmissionGuard("claude"),
+                _fable_screen_with_text("[Pasted Content 2303 chars]"),
+            ),
+        )
+        for guard, screen in cases:
+            with self.subTest(provider=guard.provider, screen=screen):
+                now = [0.0]
+                injector = wrapper_windows._make_admitted_injector(
+                    composer_guard=guard,
+                    monotonic=lambda: now[0],
+                )
+                cancelled = {
+                    "status": "cancelled",
+                    "_owned_cancelled_screen": screen,
+                    "event": {
+                        "action": "injection-enter-cancelled",
+                        "fingerprint": "invalid-pill-proof",
+                    },
+                }
+                with (
+                    mock.patch.object(
+                        wrapper_windows,
+                        "_injection_attempt",
+                        return_value=cancelled,
+                    ),
+                    mock.patch.object(
+                        wrapper_windows,
+                        "_read_visible_console_text",
+                        return_value=screen,
+                    ),
+                    mock.patch.object(
+                        wrapper_windows, "_write_key"
+                    ) as write_key,
+                ):
+                    self.assertEqual(injector(text), "cancelled")
+                    for due in (2.0, 6.0, 14.0):
+                        now[0] = due
+                        self.assertEqual(injector(text), "deferred")
+                write_key.assert_not_called()
+
+    def test_paste_pill_proof_is_consumed_before_failed_escape(self):
+        text = "x" * 2303
+        pill_screen = _codex_screen_with_text(
+            "[Pasted Content 2303 chars]"
+        )
+        guard = wrapper_windows._ComposerAdmissionGuard("codex")
+        now = [0.0]
+        injector = wrapper_windows._make_admitted_injector(
+            composer_guard=guard,
+            monotonic=lambda: now[0],
+        )
+        cancelled = {
+            "status": "cancelled",
+            "_owned_cancelled_screen": pill_screen,
+            "event": {
+                "action": "injection-enter-cancelled",
+                "fingerprint": "single-use-pill-proof",
+            },
+        }
+        with (
+            mock.patch.object(
+                wrapper_windows, "_injection_attempt", return_value=cancelled
+            ) as attempt,
+            mock.patch.object(
+                wrapper_windows,
+                "_read_visible_console_text",
+                return_value=pill_screen,
+            ),
+            mock.patch.object(
+                wrapper_windows.kernel32, "GetStdHandle", return_value=123
+            ),
+            mock.patch.object(
+                wrapper_windows,
+                "_write_key",
+                side_effect=OSError("synthetic Escape failure"),
+            ) as write_key,
+            mock.patch.object(wrapper_windows.time, "sleep"),
+        ):
+            self.assertEqual(injector(text), "cancelled")
+            for due in (2.0, 6.0, 14.0, 30.0):
+                now[0] = due
+                self.assertEqual(injector(text), "deferred")
+
+        # The first key-down failed on the second stable sighting. The proof
+        # was already consumed, so later identical pills cannot retry Escape.
+        self.assertEqual(write_key.call_count, 1)
+        self.assertEqual(attempt.call_count, 1)
+
+    def test_paste_pill_transcript_change_resets_two_probe_stability(self):
+        text = "x" * 2303
+        base = _codex_screen_with_text("[Pasted Content 2303 chars]")
+        first = base.replace("2m 10s", "2m 11s")
+        changed = base.replace("2m 10s", "2m 12s")
+        guard = wrapper_windows._ComposerAdmissionGuard("codex")
+        now = [0.0]
+        injector = wrapper_windows._make_admitted_injector(
+            composer_guard=guard,
+            monotonic=lambda: now[0],
+        )
+        cancelled = {
+            "status": "cancelled",
+            "_owned_cancelled_screen": base,
+            "event": {
+                "action": "injection-enter-cancelled",
+                "fingerprint": "pill-transcript-reset",
+            },
+        }
+        with (
+            mock.patch.object(
+                wrapper_windows, "_injection_attempt", return_value=cancelled
+            ),
+            mock.patch.object(
+                wrapper_windows,
+                "_read_visible_console_text",
+                side_effect=[first, changed, changed, CODEX_IDLE],
+            ),
+            mock.patch.object(
+                wrapper_windows.kernel32, "GetStdHandle", return_value=123
+            ),
+            mock.patch.object(wrapper_windows, "_write_key") as write_key,
+            mock.patch.object(wrapper_windows.time, "sleep"),
+        ):
+            self.assertEqual(injector(text), "cancelled")
+            for due in (2.0, 6.0):
+                now[0] = due
+                self.assertEqual(injector(text), "deferred")
+                write_key.assert_not_called()
+            now[0] = 14.0
+            self.assertEqual(injector(text), "deferred")
+
+        self.assertEqual(write_key.call_count, 2)
+
+    def test_paste_pill_composer_mutation_invalidates_proof(self):
+        text = "x" * 2303
+        pill = _codex_screen_with_text("[Pasted Content 2303 chars]")
+        operator_draft = _codex_screen_with_text(
+            "[Pasted Content 2303 chars] operator draft"
+        )
+        guard = wrapper_windows._ComposerAdmissionGuard("codex")
+        now = [0.0]
+        injector = wrapper_windows._make_admitted_injector(
+            composer_guard=guard,
+            monotonic=lambda: now[0],
+        )
+        cancelled = {
+            "status": "cancelled",
+            "_owned_cancelled_screen": pill,
+            "event": {
+                "action": "injection-enter-cancelled",
+                "fingerprint": "pill-composer-mutation",
+            },
+        }
+        with (
+            mock.patch.object(
+                wrapper_windows, "_injection_attempt", return_value=cancelled
+            ),
+            mock.patch.object(
+                wrapper_windows,
+                "_read_visible_console_text",
+                side_effect=[pill, operator_draft, pill, pill],
+            ),
+            mock.patch.object(wrapper_windows, "_write_key") as write_key,
+        ):
+            self.assertEqual(injector(text), "cancelled")
+            for due in (2.0, 6.0, 14.0, 30.0):
+                now[0] = due
+                self.assertEqual(injector(text), "deferred")
+
+        write_key.assert_not_called()
 
     def test_exact_owned_text_with_changing_active_output_never_clears(self):
         owned = "wrapper-owned batch"

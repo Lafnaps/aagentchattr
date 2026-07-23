@@ -309,6 +309,9 @@ def _injection_attempt(text: str, *, delay: float = 0.3,
     if enter_cancelled:
         return {
             "status": "cancelled",
+            # Private, in-memory provenance only. Callers emit only `event`;
+            # this raw snapshot is never persisted or included in alerts.
+            "_owned_cancelled_screen": cancelled_screen,
             "event": {
                 "action": "injection-enter-cancelled",
                 "classification": (
@@ -337,17 +340,19 @@ def _probe_injection_admission(*, safeguard_guard: bool,
                                composer_guard,
                                allow_active: bool = False,
                                owned_text: str | None = None,
-                               owned_clear_candidate: dict | None = None) -> dict:
+                               owned_clear_candidate: dict | None = None,
+                               owned_paste_proof: dict | None = None) -> dict:
     """Fail-closed recovery probe; never sends wrapper text or Enter.
 
     The same fail-closed ordering as _injection_attempt is used, but a
     positive stable-empty result is returned to the watcher instead of
     immediately attempting delivery. By default it is read-only. A cancelled
     episode may additionally clear its exact in-memory owned composer batch
-    with Escape, but only after two consecutive due probes prove the complete
-    screen stable under the normal composer discipline. A positively empty
-    redraw is then required. This is the only way a blocked cancellation/error
-    episode can become eligible for another attempt.
+    (or a one-shot, cancellation-bound Codex paste pill with the exact Python
+    character count) with Escape, but only after two consecutive due probes
+    prove the complete screen stable under the normal composer discipline. A
+    positively empty redraw is then required. This is the only way a blocked
+    cancellation/error episode can become eligible for another attempt.
     """
     read_error_type = None
     owned_cleared = False
@@ -382,6 +387,7 @@ def _probe_injection_admission(*, safeguard_guard: bool,
                 owned_text,
                 composer_guard,
                 owned_clear_candidate,
+                owned_paste_proof=owned_paste_proof,
             )
         else:
             clear_armed = False
@@ -395,6 +401,11 @@ def _probe_injection_admission(*, safeguard_guard: bool,
             # must earn two new stable exact observations from scratch.
             if owned_clear_candidate is not None:
                 owned_clear_candidate.clear()
+            # A cancellation-bound paste-pill proof is single-use. Consume it
+            # before the first Escape key event; a failed/uncertain clear can
+            # never reuse the same provenance on a later probe.
+            if owned_paste_proof is not None:
+                owned_paste_proof.clear()
             handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
             clear_error_type = None
             try:
@@ -504,6 +515,7 @@ def _make_admitted_injector(*, delay: float = 0.3,
     episode_fingerprint = ""
     episode_owned_text = None
     owned_clear_candidate = {}
+    owned_paste_proof = {}
 
     def _schedule_probe(now: float, *, first: bool = False) -> None:
         nonlocal next_probe_at, probe_delay
@@ -521,6 +533,7 @@ def _make_admitted_injector(*, delay: float = 0.3,
         episode_fingerprint = ""
         episode_owned_text = None
         owned_clear_candidate.clear()
+        owned_paste_proof.clear()
 
     def _retry_after() -> float:
         if not blocked_episode:
@@ -539,6 +552,15 @@ def _make_admitted_injector(*, delay: float = 0.3,
             owned_text if isinstance(owned_text, str) and owned_text else None
         )
         owned_clear_candidate.clear()
+        owned_paste_proof.clear()
+        if episode_owned_text is not None:
+            pill = _codex_cancelled_owned_paste_pill(
+                result.get("_owned_cancelled_screen"),
+                episode_owned_text,
+                composer_guard,
+            )
+            if pill is not None:
+                owned_paste_proof["pill"] = pill
         _schedule_probe(clock(), first=True)
         if emit:
             # This is the single operator-facing notification for the
@@ -572,6 +594,7 @@ def _make_admitted_injector(*, delay: float = 0.3,
             allow_active=allow_active,
             owned_text=episode_owned_text,
             owned_clear_candidate=owned_clear_candidate,
+            owned_paste_proof=owned_paste_proof,
         )
         if result.get("owned_cleared"):
             # The stale exact-owned batch is gone. Keep the episode armed until
@@ -579,6 +602,7 @@ def _make_admitted_injector(*, delay: float = 0.3,
             # re-coalesce and type the full current durable queue batch.
             episode_owned_text = None
             owned_clear_candidate.clear()
+            owned_paste_proof.clear()
         if result["ready"]:
             _reset_blocked_episode()
             return True
@@ -1424,16 +1448,56 @@ def _owned_composer_text_is_exact(screen: str, text: str,
     )
 
 
+_CODEX_PASTED_CONTENT_PILL = re.compile(
+    r"\[Pasted Content ([1-9][0-9]*|0) chars\]"
+)
+
+
+def _codex_cancelled_owned_paste_pill(screen, text: str,
+                                      composer_guard) -> str | None:
+    """Return an exact Codex paste pill bound to this cancelled text batch.
+
+    This helper is intentionally unusable as generic composer ownership. It is
+    called on the private screen captured immediately after _injection_attempt
+    withheld Enter, and accepts only Codex's exact live shape whose canonical
+    decimal character count equals Python len(text).
+    """
+    if (
+        not isinstance(screen, str)
+        or not isinstance(text, str)
+        or not text
+        or composer_guard is None
+        or composer_guard.provider != "codex"
+    ):
+        return None
+    state, content, row = _composer_state(
+        screen,
+        composer_guard.markers,
+        composer_guard.placeholders,
+        composer_guard.separator,
+        composer_guard.empty_requires_separator,
+    )
+    if state != "nonempty" or row < 0:
+        return None
+    match = _CODEX_PASTED_CONTENT_PILL.fullmatch(content)
+    if match is None or match.group(1) != str(len(text)):
+        return None
+    return content
+
+
 def _owned_clear_stability_observation(screen: str, text: str,
                                        composer_guard,
-                                       candidate: dict | None):
+                                       candidate: dict | None,
+                                       owned_paste_proof: dict | None = None):
     """Track an exact-owned clear candidate across due recovery probes.
 
     Return (exact, armed). Arming requires two consecutive exact observations
     whose full screen snapshots satisfy the admission guard's existing
-    _stable_against discipline. Any other observation discards the candidate;
-    a changed transcript/status becomes the first sighting of a new candidate
-    and therefore cannot authorize Escape.
+    _stable_against discipline. Generic exact text remains the default; a
+    Codex paste pill additionally needs the private, immediate-cancellation
+    proof. Any other observation discards the candidate; a changed
+    transcript/status becomes the first sighting of a new candidate and
+    therefore cannot authorize Escape.
     """
     if candidate is None:
         return False, False
@@ -1444,10 +1508,31 @@ def _owned_clear_stability_observation(screen: str, text: str,
         composer_guard.separator,
         composer_guard.empty_requires_separator,
     )
+    direct_exact = _owned_composer_text_is_exact(
+        screen, text, composer_guard
+    )
+    current_paste_pill = _codex_cancelled_owned_paste_pill(
+        screen, text, composer_guard
+    )
+    owned_paste_pill = (
+        owned_paste_proof.get("pill")
+        if owned_paste_proof is not None else None
+    )
+    proven_paste_exact = (
+        owned_paste_pill is not None
+        and current_paste_pill == owned_paste_pill
+    )
+    if owned_paste_pill is not None and not (
+        proven_paste_exact or direct_exact
+    ):
+        # The immediate cancellation-bound pill is no longer the composer.
+        # An operator edit/count change destroys that one-shot provenance;
+        # seeing the same pill later cannot resurrect it.
+        owned_paste_proof.clear()
     if (
         state != "nonempty"
         or row < 0
-        or not _owned_composer_text_is_exact(screen, text, composer_guard)
+        or not (direct_exact or proven_paste_exact)
     ):
         candidate.clear()
         return False, False

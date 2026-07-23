@@ -24,6 +24,7 @@ STD_INPUT_HANDLE = -10
 STD_OUTPUT_HANDLE_FOR_VT = -11  # kept distinct from STD_OUTPUT_HANDLE below to avoid forward-ref
 KEY_EVENT = 0x0001
 VK_RETURN = 0x0D
+VK_ESCAPE = 0x1B
 VK_DOWN = 0x28
 
 # Console-mode bits for SetConsoleMode (Windows Console API)
@@ -334,21 +335,99 @@ def _injection_attempt(text: str, *, delay: float = 0.3,
 
 def _probe_injection_admission(*, safeguard_guard: bool,
                                composer_guard,
-                               allow_active: bool = False) -> dict:
-    """Read-only recovery probe; never sends text or Enter.
+                               allow_active: bool = False,
+                               owned_text: str | None = None,
+                               owned_clear_candidate: dict | None = None) -> dict:
+    """Fail-closed recovery probe; never sends wrapper text or Enter.
 
     The same fail-closed ordering as _injection_attempt is used, but a
     positive stable-empty result is returned to the watcher instead of
-    immediately attempting delivery.  This is the only way a blocked
-    cancellation/error episode can become eligible for another attempt.
+    immediately attempting delivery. By default it is read-only. A cancelled
+    episode may additionally clear its exact in-memory owned composer batch
+    with Escape, but only after two consecutive due probes prove the complete
+    screen stable under the normal composer discipline. A positively empty
+    redraw is then required. This is the only way a blocked cancellation/error
+    episode can become eligible for another attempt.
     """
     read_error_type = None
+    owned_cleared = False
+    owned_exact = False
+    owned_clear_attempted = False
     with _inject_lock:
         try:
             screen = _read_visible_console_text()
         except Exception as exc:
             screen = ""
             read_error_type = type(exc).__name__
+
+        safeguard_blocked = (
+            read_error_type is None
+            and safeguard_guard
+            and _screen_blocks_safeguard_input(screen)
+        )
+        # A cancelled attempt may have written the complete wrapper batch but
+        # withheld Enter after a redraw. A single exact snapshot is not enough:
+        # the child may still be producing output. Arm Escape only after two
+        # consecutive due probes see both the exact in-memory owned composer
+        # and a full screen stable under _stable_against (whose sole tolerance
+        # is a cursor-cell delta on the same composer row).
+        if (
+            read_error_type is None
+            and owned_text
+            and composer_guard is not None
+            and not safeguard_blocked
+        ):
+            owned_exact, clear_armed = _owned_clear_stability_observation(
+                screen,
+                owned_text,
+                composer_guard,
+                owned_clear_candidate,
+            )
+        else:
+            clear_armed = False
+            if owned_clear_candidate is not None:
+                owned_clear_candidate.clear()
+
+        if clear_armed:
+            owned_clear_attempted = True
+            # Every clear attempt consumes its two-sighting proof. If Escape
+            # fails or the redraw is not positively empty, the next attempt
+            # must earn two new stable exact observations from scratch.
+            if owned_clear_candidate is not None:
+                owned_clear_candidate.clear()
+            handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+            clear_error_type = None
+            try:
+                _write_key(
+                    handle, "\x1b", True, vk=VK_ESCAPE, scan=0x01
+                )
+                _write_key(
+                    handle, "\x1b", False, vk=VK_ESCAPE, scan=0x01
+                )
+            except Exception as exc:
+                clear_error_type = type(exc).__name__
+            time.sleep(0.05)
+            try:
+                screen = _read_visible_console_text()
+            except Exception as exc:
+                screen = ""
+                read_error_type = type(exc).__name__
+            else:
+                state, _content, _row = _composer_state(
+                    screen,
+                    composer_guard.markers,
+                    composer_guard.placeholders,
+                    composer_guard.separator,
+                    composer_guard.empty_requires_separator,
+                )
+                if clear_error_type is not None:
+                    # The effect of a failed key-down/key-up pair is uncertain.
+                    # An empty redraw cannot prove an atomic wrapper clear.
+                    read_error_type = clear_error_type
+                elif state == "empty":
+                    owned_cleared = True
+                    composer_guard.reset_stability()
+
         if read_error_type:
             classification = "unreadable"
             if composer_guard is not None:
@@ -365,6 +444,13 @@ def _probe_injection_admission(*, safeguard_guard: bool,
             # A blocked episode cannot be recovered by guessing that an
             # unknown composer is empty.
             classification = "unrecognized-composer"
+        elif owned_exact and not owned_clear_attempted:
+            # Exact ownership has one stable sighting only. Keep the blocked
+            # episode armed and wait for the next due probe; never send Escape
+            # on the first observation.
+            classification = "owned-clear-pending"
+        elif owned_clear_attempted and not owned_cleared:
+            classification = "owned-clear-unverified"
         else:
             classification = (
                 composer_guard.classify_active(screen)
@@ -373,6 +459,7 @@ def _probe_injection_admission(*, safeguard_guard: bool,
     return {
         "ready": classification == "admit",
         "classification": classification,
+        "owned_cleared": owned_cleared,
         **({"error_type": read_error_type} if read_error_type else {}),
     }
 
@@ -395,12 +482,15 @@ def _make_admitted_injector(*, delay: float = 0.3,
 
     If text was typed but Enter was cancelled because a safeguard menu
     appeared, the durable queue remains pending but the injector enters a
-    blocked-composer episode.  It emits that cancellation/error once, then performs
-    read-only recovery probes with exponential backoff.  No text or Enter is
-    attempted again until the admission guard has positively observed a
-    stable empty composer.  The watcher can query retry_after() and call
-    recovery_probe() before touching its journal.  One audit-only watchdog
-    record is emitted per episode; it is not a chat notification.
+    blocked-composer episode. It emits that cancellation/error once, then
+    performs fail-closed recovery probes with exponential backoff. No wrapper
+    text or Enter is attempted again until the admission guard has positively
+    observed a stable empty composer; only an exact in-memory owned cancelled
+    batch seen unchanged on two consecutive due probes may receive Escape
+    clearing first. The watcher can query
+    retry_after() and call recovery_probe() before touching its journal. One
+    audit-only watchdog record is emitted per episode; it is not a chat
+    notification.
     """
 
     clock = monotonic or time.monotonic
@@ -412,6 +502,8 @@ def _make_admitted_injector(*, delay: float = 0.3,
     next_probe_at = 0.0
     probe_delay = probe_initial
     episode_fingerprint = ""
+    episode_owned_text = None
+    owned_clear_candidate = {}
 
     def _schedule_probe(now: float, *, first: bool = False) -> None:
         nonlocal next_probe_at, probe_delay
@@ -422,24 +514,31 @@ def _make_admitted_injector(*, delay: float = 0.3,
 
     def _reset_blocked_episode() -> None:
         nonlocal blocked_episode, next_probe_at, probe_delay
-        nonlocal episode_fingerprint
+        nonlocal episode_fingerprint, episode_owned_text
         blocked_episode = False
         next_probe_at = 0.0
         probe_delay = probe_initial
         episode_fingerprint = ""
+        episode_owned_text = None
+        owned_clear_candidate.clear()
 
     def _retry_after() -> float:
         if not blocked_episode:
             return 0.0
         return max(0.0, next_probe_at - clock())
 
-    def _enter_blocked_episode(result: dict, *, operator_alert: bool = True) -> None:
-        nonlocal blocked_episode, episode_fingerprint
+    def _enter_blocked_episode(result: dict, *, operator_alert: bool = True,
+                               owned_text: str | None = None) -> None:
+        nonlocal blocked_episode, episode_fingerprint, episode_owned_text
         if blocked_episode:
             return
         blocked_episode = True
         event = result.get("event") or {}
         episode_fingerprint = str(event.get("fingerprint") or "unknown")
+        episode_owned_text = (
+            owned_text if isinstance(owned_text, str) and owned_text else None
+        )
+        owned_clear_candidate.clear()
         _schedule_probe(clock(), first=True)
         if emit:
             # This is the single operator-facing notification for the
@@ -460,7 +559,8 @@ def _make_admitted_injector(*, delay: float = 0.3,
             })
 
     def _recovery_probe_mode(*, allow_active: bool = False) -> bool:
-        """Return True only after a due, read-only stable-empty probe."""
+        """Return True only after due, fail-closed empty admission."""
+        nonlocal episode_owned_text
         if not blocked_episode:
             return True
         now = clock()
@@ -470,7 +570,15 @@ def _make_admitted_injector(*, delay: float = 0.3,
             safeguard_guard=safeguard_guard,
             composer_guard=composer_guard,
             allow_active=allow_active,
+            owned_text=episode_owned_text,
+            owned_clear_candidate=owned_clear_candidate,
         )
+        if result.get("owned_cleared"):
+            # The stale exact-owned batch is gone. Keep the episode armed until
+            # normal empty-composer admission succeeds; the watcher will then
+            # re-coalesce and type the full current durable queue batch.
+            episode_owned_text = None
+            owned_clear_candidate.clear()
         if result["ready"]:
             _reset_blocked_episode()
             return True
@@ -534,8 +642,12 @@ def _make_admitted_injector(*, delay: float = 0.3,
         if status in ("cancelled", "error"):
             # Both outcomes may leave text in the composer.  They therefore
             # start the same deduped fail-closed episode; no retry is possible
-            # until the read-only recovery probe proves stable-empty.
-            _enter_blocked_episode(result)
+            # until bounded recovery proves stable-empty (or safely clears a
+            # twice-observed stable exact-owned cancelled batch first).
+            _enter_blocked_episode(
+                result,
+                owned_text=text if status == "cancelled" else None,
+            )
             return status
         if emit:
             emit(result["event"])
@@ -1269,6 +1381,90 @@ def _typed_text_visible(post_screen: str, pre_screen, text: str,
             break  # row is not a continuation of our text (border/hints)
         accumulated = candidate
     return accumulated == text_ns
+
+
+def _owned_composer_text_is_exact(screen: str, text: str,
+                                  composer_guard) -> bool:
+    """Prove visible composer text exactly equals our in-memory batch.
+
+    Recovery accepts no whitespace normalization, decorated/wrapped-row
+    reconstruction, paste pill, prefix, suffix, or digest match. Newlines are
+    supported only when each continuation is exposed as the next raw screen
+    row byte-for-codepoint; ambiguous TUI indentation or soft wrapping fails
+    closed. Live queue delivery is flattened before injection, but this strict
+    path also covers direct multiline callers without pretending that layout
+    normalization proves ownership.
+    """
+    if not isinstance(text, str) or not text or "\r" in text:
+        return False
+    state, content, row = _composer_state(
+        screen,
+        composer_guard.markers,
+        composer_guard.placeholders,
+        composer_guard.separator,
+        composer_guard.empty_requires_separator,
+    )
+    logical_lines = text.split("\n")
+    if (
+        state != "nonempty"
+        or row < 0
+        or content != logical_lines[0]
+    ):
+        return False
+    if len(logical_lines) == 1:
+        return True
+    screen_lines = screen.split("\n")
+    if len(screen_lines) != len(screen.splitlines()):
+        return False
+    if row + len(logical_lines) > len(screen_lines):
+        return False
+    return all(
+        screen_lines[row + offset] == expected
+        for offset, expected in enumerate(logical_lines[1:], start=1)
+    )
+
+
+def _owned_clear_stability_observation(screen: str, text: str,
+                                       composer_guard,
+                                       candidate: dict | None):
+    """Track an exact-owned clear candidate across due recovery probes.
+
+    Return (exact, armed). Arming requires two consecutive exact observations
+    whose full screen snapshots satisfy the admission guard's existing
+    _stable_against discipline. Any other observation discards the candidate;
+    a changed transcript/status becomes the first sighting of a new candidate
+    and therefore cannot authorize Escape.
+    """
+    if candidate is None:
+        return False, False
+    state, _content, row = _composer_state(
+        screen,
+        composer_guard.markers,
+        composer_guard.placeholders,
+        composer_guard.separator,
+        composer_guard.empty_requires_separator,
+    )
+    if (
+        state != "nonempty"
+        or row < 0
+        or not _owned_composer_text_is_exact(screen, text, composer_guard)
+    ):
+        candidate.clear()
+        return False, False
+
+    previous_screen = candidate.get("screen")
+    previous_row = candidate.get("row", -1)
+    previous_hits = candidate.get("hits", 0)
+    stable = (
+        isinstance(previous_screen, str)
+        and composer_guard._stable_against(
+            previous_screen, previous_row, screen, row
+        )
+    )
+    hits = previous_hits + 1 if stable else 1
+    candidate.clear()
+    candidate.update({"screen": screen, "row": row, "hits": hits})
+    return True, hits >= 2
 
 
 class _ComposerAdmissionGuard:

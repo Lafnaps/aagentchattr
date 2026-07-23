@@ -38,6 +38,12 @@ CODEX_IDLE = "\n".join([
     "  send /help for commands",
 ])
 
+CODEX_UPDATE_MODAL = "\n".join([
+    "codex banner",
+    "Update available: 0.144.0 -> 0.145.0",
+    "Press Enter to update now or Esc to dismiss",
+])
+
 FABLE_IDLE = "\n".join([
     "✻ transcript output",
     "╭──────────────────────────────────────╮",
@@ -53,6 +59,18 @@ def _codex_screen_with_text(text: str) -> str:
         "Worked for 2m 10s",
         "",
         "› " + text,
+        "  send /help for commands",
+    ])
+
+
+def _codex_screen_with_multiline_text(text: str) -> str:
+    first, *continuations = text.split("\n")
+    return "\n".join([
+        "codex banner",
+        "Worked for 2m 10s",
+        "",
+        "› " + first,
+        *continuations,
         "  send /help for commands",
     ])
 
@@ -430,6 +448,28 @@ class TypedTextVisibleTests(unittest.TestCase):
 
     def test_unchanged_screen_suppresses(self):
         self.assertFalse(self._visible(CODEX_IDLE, pre=CODEX_IDLE))
+
+    def test_owned_recovery_match_is_exact_including_multiline(self):
+        guard = self._guard()
+        multiline = self.TEXT + "\nDELIVERY_ENVELOPE\n{\"event_ids\":[\"evt-1\"]}"
+        self.assertTrue(wrapper_windows._owned_composer_text_is_exact(
+            _codex_screen_with_multiline_text(multiline), multiline, guard
+        ))
+        for mutant in (
+            multiline + "Z",
+            "Z" + multiline,
+            multiline.replace(" ", "  ", 1),
+            multiline.replace("evt-1", "evt-2"),
+            multiline.replace("\nDELIVERY", "\n DELIVERY"),
+        ):
+            with self.subTest(mutant=mutant):
+                self.assertFalse(
+                    wrapper_windows._owned_composer_text_is_exact(
+                        _codex_screen_with_multiline_text(mutant),
+                        multiline,
+                        guard,
+                    )
+                )
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows-only injection gate")
@@ -813,6 +853,422 @@ class InjectAttemptTests(unittest.TestCase):
         self.assertEqual(attempt.call_count, 2)
         self.assertTrue(attempt.call_args.kwargs["allow_active"])
 
+    def test_startup_update_modal_backs_off_then_delivers_once_empty(self):
+        text = "use mcp to read #owner-telegram - startup wake"
+        guard = wrapper_windows._ComposerAdmissionGuard("codex")
+        events = []
+        now = [0.0]
+        injector = wrapper_windows._make_admitted_injector(
+            composer_guard=guard,
+            emit=events.append,
+            monotonic=lambda: now[0],
+        )
+        screens = iter([
+            CODEX_UPDATE_MODAL,              # initial attempt: no composer
+            CODEX_IDLE,                      # recovery sighting 1
+            CODEX_IDLE,                      # recovery sighting 2
+            CODEX_IDLE,                      # re-armed attempt admission
+            _codex_screen_with_text(text),   # exact post-type preflight
+        ])
+        calls = []
+        with (
+            mock.patch.object(
+                wrapper_windows.kernel32, "GetStdHandle", return_value=123
+            ),
+            mock.patch.object(
+                wrapper_windows.kernel32,
+                "WriteConsoleInputW",
+                side_effect=self._console_writer(calls),
+            ),
+            mock.patch.object(
+                wrapper_windows,
+                "_read_visible_console_text",
+                side_effect=lambda *a, **k: next(screens),
+            ) as read_screen,
+            mock.patch.object(wrapper_windows.time, "sleep"),
+        ):
+            self.assertEqual(injector(text), "deferred")
+            self.assertEqual(injector.retry_after(), 2.0)
+            self.assertEqual(calls, [])
+
+            now[0] = 1.0
+            self.assertEqual(injector(text), "deferred")
+            self.assertEqual(read_screen.call_count, 1)
+            self.assertEqual(calls, [])
+
+            now[0] = 2.0
+            self.assertEqual(injector(text), "deferred")
+            self.assertEqual(injector.retry_after(), 4.0)
+            self.assertEqual(calls, [])
+
+            now[0] = 6.0
+            self.assertEqual(injector(text), "injected")
+
+        enters = [
+            event for batch in calls for event in batch
+            if event[2] == wrapper_windows.VK_RETURN
+        ]
+        self.assertEqual(len(enters), 2)  # one key-down + one key-up
+        self.assertEqual(
+            [event["action"] for event in events],
+            ["injection-deferred", "injection-recovery-watchdog"],
+        )
+
+    def test_first_exact_probe_has_no_key_second_stable_due_clears(self):
+        old_text = (
+            "use mcp to read #general - wrapper-owned old batch\n\n"
+            "DELIVERY_ENVELOPE\n{\"event_ids\":[\"evt-old\"]}"
+        )
+        new_text = (
+            old_text
+            + "\n{\"event_ids\":[\"evt-old\",\"evt-new\"]}"
+        )
+        guard = wrapper_windows._ComposerAdmissionGuard("codex")
+        now = [0.0]
+        injector = wrapper_windows._make_admitted_injector(
+            composer_guard=guard,
+            monotonic=lambda: now[0],
+        )
+        cancelled = {
+            "status": "cancelled",
+            "event": {
+                "action": "injection-enter-cancelled",
+                "fingerprint": "owned-cancelled",
+            },
+        }
+        with (
+            mock.patch.object(
+                wrapper_windows,
+                "_injection_attempt",
+                side_effect=[cancelled, {"status": "injected"}],
+            ) as attempt,
+            mock.patch.object(
+                wrapper_windows,
+                "_read_visible_console_text",
+                side_effect=[
+                    _codex_screen_with_multiline_text(old_text),
+                    _codex_screen_with_multiline_text(old_text),
+                    CODEX_IDLE,
+                    CODEX_IDLE,
+                ],
+            ),
+            mock.patch.object(
+                wrapper_windows.kernel32, "GetStdHandle", return_value=123
+            ),
+            mock.patch.object(wrapper_windows, "_write_key") as write_key,
+            mock.patch.object(wrapper_windows.time, "sleep"),
+        ):
+            self.assertEqual(injector(old_text), "cancelled")
+            now[0] = 2.0
+            self.assertEqual(injector(new_text), "deferred")
+            self.assertEqual(attempt.call_count, 1)
+            self.assertEqual(injector.retry_after(), 4.0)
+            write_key.assert_not_called()
+
+            now[0] = 6.0
+            self.assertEqual(injector(new_text), "deferred")
+            self.assertEqual(write_key.call_count, 2)
+
+            now[0] = 14.0
+            self.assertEqual(injector(new_text), "injected")
+
+        self.assertEqual(write_key.call_count, 2)
+        self.assertTrue(all(
+            call.kwargs["vk"] == wrapper_windows.VK_ESCAPE
+            for call in write_key.call_args_list
+        ))
+        self.assertEqual(
+            [call.args[0] for call in attempt.call_args_list],
+            [old_text, new_text],
+        )
+
+    def test_exact_owned_text_with_changing_active_output_never_clears(self):
+        owned = "wrapper-owned batch"
+        guard = wrapper_windows._ComposerAdmissionGuard("codex")
+        now = [0.0]
+        injector = wrapper_windows._make_admitted_injector(
+            composer_guard=guard,
+            monotonic=lambda: now[0],
+        )
+        cancelled = {
+            "status": "cancelled",
+            "event": {
+                "action": "injection-enter-cancelled",
+                "fingerprint": "active-output",
+            },
+        }
+        screens = [
+            _codex_screen_with_text(owned).replace("2m 10s", "2m 11s"),
+            _codex_screen_with_text(owned).replace("2m 10s", "2m 12s"),
+            _codex_screen_with_text(owned).replace("2m 10s", "2m 13s"),
+        ]
+        with (
+            mock.patch.object(
+                wrapper_windows, "_injection_attempt", return_value=cancelled
+            ) as attempt,
+            mock.patch.object(
+                wrapper_windows,
+                "_read_visible_console_text",
+                side_effect=screens,
+            ),
+            mock.patch.object(wrapper_windows, "_write_key") as write_key,
+        ):
+            self.assertEqual(injector(owned), "cancelled")
+            for due in (2.0, 6.0, 14.0):
+                now[0] = due
+                self.assertEqual(injector(owned), "deferred")
+                write_key.assert_not_called()
+
+        self.assertEqual(attempt.call_count, 1)
+
+    def test_owned_clear_allows_only_cursor_cell_delta_on_second_probe(self):
+        owned = "wrapper-owned batch"
+        guard = wrapper_windows._ComposerAdmissionGuard("codex")
+        now = [0.0]
+        injector = wrapper_windows._make_admitted_injector(
+            composer_guard=guard,
+            monotonic=lambda: now[0],
+        )
+        cancelled = {
+            "status": "cancelled",
+            "event": {
+                "action": "injection-enter-cancelled",
+                "fingerprint": "cursor-delta",
+            },
+        }
+        with (
+            mock.patch.object(
+                wrapper_windows, "_injection_attempt", return_value=cancelled
+            ),
+            mock.patch.object(
+                wrapper_windows,
+                "_read_visible_console_text",
+                side_effect=[
+                    _codex_screen_with_text(owned),
+                    _codex_screen_with_text(owned + "▌"),
+                    CODEX_IDLE,
+                ],
+            ),
+            mock.patch.object(
+                wrapper_windows.kernel32, "GetStdHandle", return_value=123
+            ),
+            mock.patch.object(wrapper_windows, "_write_key") as write_key,
+            mock.patch.object(wrapper_windows.time, "sleep"),
+        ):
+            self.assertEqual(injector(owned), "cancelled")
+            now[0] = 2.0
+            self.assertEqual(injector(owned), "deferred")
+            write_key.assert_not_called()
+            now[0] = 6.0
+            self.assertEqual(injector(owned), "deferred")
+
+        self.assertEqual(write_key.call_count, 2)
+
+    def test_owned_text_mutation_resets_two_probe_stability(self):
+        owned = "wrapper-owned batch"
+        mutated = _codex_screen_with_text(owned + " operator-edit")
+        exact = _codex_screen_with_text(owned)
+        guard = wrapper_windows._ComposerAdmissionGuard("codex")
+        now = [0.0]
+        injector = wrapper_windows._make_admitted_injector(
+            composer_guard=guard,
+            monotonic=lambda: now[0],
+        )
+        cancelled = {
+            "status": "cancelled",
+            "event": {
+                "action": "injection-enter-cancelled",
+                "fingerprint": "mutation-reset",
+            },
+        }
+        with (
+            mock.patch.object(
+                wrapper_windows, "_injection_attempt", return_value=cancelled
+            ),
+            mock.patch.object(
+                wrapper_windows,
+                "_read_visible_console_text",
+                side_effect=[exact, mutated, exact, exact, CODEX_IDLE],
+            ),
+            mock.patch.object(
+                wrapper_windows.kernel32, "GetStdHandle", return_value=123
+            ),
+            mock.patch.object(wrapper_windows, "_write_key") as write_key,
+            mock.patch.object(wrapper_windows.time, "sleep"),
+        ):
+            self.assertEqual(injector(owned), "cancelled")
+            for due in (2.0, 6.0, 14.0):
+                now[0] = due
+                self.assertEqual(injector(owned), "deferred")
+                write_key.assert_not_called()
+            now[0] = 30.0
+            self.assertEqual(injector(owned), "deferred")
+
+        self.assertEqual(write_key.call_count, 2)
+
+    def test_cancelled_mutated_or_restart_text_is_never_cleared(self):
+        owned = (
+            "use mcp to read #general - wrapper-owned batch\n"
+            "DELIVERY_ENVELOPE\n{\"event_ids\":[\"evt-old\"]}"
+        )
+        mutated = _codex_screen_with_multiline_text(
+            owned.replace("evt-old", "evt-operator")
+        )
+        cancelled = {
+            "status": "cancelled",
+            "event": {
+                "action": "injection-enter-cancelled",
+                "fingerprint": "owned-cancelled",
+            },
+        }
+
+        for restarted in (False, True):
+            with self.subTest(restarted=restarted):
+                guard = wrapper_windows._ComposerAdmissionGuard("codex")
+                now = [0.0]
+                injector = wrapper_windows._make_admitted_injector(
+                    composer_guard=guard,
+                    monotonic=lambda: now[0],
+                )
+                first = (
+                    {
+                        "status": "deferred",
+                        "classification": "nonempty-composer",
+                        "event": {
+                            "action": "injection-deferred",
+                            "classification": "nonempty-composer",
+                            "fingerprint": "restart-no-owner",
+                        },
+                    }
+                    if restarted else cancelled
+                )
+                with (
+                    mock.patch.object(
+                        wrapper_windows,
+                        "_injection_attempt",
+                        return_value=first,
+                    ) as attempt,
+                    mock.patch.object(
+                        wrapper_windows,
+                        "_read_visible_console_text",
+                        return_value=(
+                            _codex_screen_with_multiline_text(owned)
+                            if restarted else mutated
+                        ),
+                    ),
+                    mock.patch.object(
+                        wrapper_windows, "_write_key"
+                    ) as write_key,
+                ):
+                    self.assertEqual(
+                        injector(owned),
+                        "deferred" if restarted else "cancelled",
+                    )
+                    now[0] = 2.0
+                    self.assertEqual(injector(owned), "deferred")
+
+                self.assertEqual(attempt.call_count, 1)
+                write_key.assert_not_called()
+
+    def test_owned_clear_error_stays_blocked_even_if_screen_looks_empty(self):
+        owned = "wrapper-owned batch\nDELIVERY_ENVELOPE"
+        guard = wrapper_windows._ComposerAdmissionGuard("codex")
+        now = [0.0]
+        injector = wrapper_windows._make_admitted_injector(
+            composer_guard=guard,
+            monotonic=lambda: now[0],
+        )
+        cancelled = {
+            "status": "cancelled",
+            "event": {
+                "action": "injection-enter-cancelled",
+                "fingerprint": "owned-cancelled",
+            },
+        }
+        with (
+            mock.patch.object(
+                wrapper_windows,
+                "_injection_attempt",
+                return_value=cancelled,
+            ) as attempt,
+            mock.patch.object(
+                wrapper_windows,
+                "_read_visible_console_text",
+                side_effect=[
+                    _codex_screen_with_multiline_text(owned),
+                    _codex_screen_with_multiline_text(owned),
+                    CODEX_IDLE,
+                ],
+            ),
+            mock.patch.object(
+                wrapper_windows.kernel32, "GetStdHandle", return_value=123
+            ),
+            mock.patch.object(
+                wrapper_windows,
+                "_write_key",
+                side_effect=OSError("clear failed"),
+            ) as write_key,
+            mock.patch.object(wrapper_windows.time, "sleep"),
+        ):
+            self.assertEqual(injector(owned), "cancelled")
+            now[0] = 2.0
+            self.assertEqual(injector(owned), "deferred")
+            self.assertEqual(injector.retry_after(), 4.0)
+            write_key.assert_not_called()
+            now[0] = 6.0
+            self.assertEqual(injector(owned), "deferred")
+            self.assertEqual(injector.retry_after(), 8.0)
+
+        self.assertEqual(write_key.call_count, 1)
+        self.assertEqual(attempt.call_count, 1)
+
+    def test_owned_clear_requires_verified_empty_post_screen(self):
+        owned = "wrapper-owned batch\nDELIVERY_ENVELOPE"
+        changed = _codex_screen_with_multiline_text(owned + " changed")
+        guard = wrapper_windows._ComposerAdmissionGuard("codex")
+        now = [0.0]
+        injector = wrapper_windows._make_admitted_injector(
+            composer_guard=guard,
+            monotonic=lambda: now[0],
+        )
+        cancelled = {
+            "status": "cancelled",
+            "event": {
+                "action": "injection-enter-cancelled",
+                "fingerprint": "owned-cancelled",
+            },
+        }
+        with (
+            mock.patch.object(
+                wrapper_windows,
+                "_injection_attempt",
+                return_value=cancelled,
+            ) as attempt,
+            mock.patch.object(
+                wrapper_windows,
+                "_read_visible_console_text",
+                side_effect=[
+                    _codex_screen_with_multiline_text(owned),
+                    _codex_screen_with_multiline_text(owned),
+                    changed,
+                ],
+            ),
+            mock.patch.object(
+                wrapper_windows.kernel32, "GetStdHandle", return_value=123
+            ),
+            mock.patch.object(wrapper_windows, "_write_key") as write_key,
+            mock.patch.object(wrapper_windows.time, "sleep"),
+        ):
+            self.assertEqual(injector(owned), "cancelled")
+            now[0] = 2.0
+            self.assertEqual(injector(owned), "deferred")
+            write_key.assert_not_called()
+            now[0] = 6.0
+            self.assertEqual(injector(owned), "deferred")
+
+        self.assertEqual(write_key.call_count, 2)
+        self.assertEqual(attempt.call_count, 1)
+
 
 class OwnerInterruptDispatchTests(unittest.TestCase):
     def test_bounded_inject_uses_active_hook_for_owner_interrupt(self):
@@ -1172,6 +1628,140 @@ class WatcherDurabilityTests(unittest.TestCase):
         self.assertIn(b"lane-test1", content)
         self.assertIn(b"orchestration", content)
         self.assertEqual(self._cursor_offset(), len(content))
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows-only injection gate")
+    def test_cancelled_owned_recovery_recoalesces_without_retry_spam(self):
+        self.queue.write_bytes(b'{"channel": "lane-test1"}\n')
+        done = threading.Event()
+        prompts = []
+        cursor_before_success = []
+        clock_values = iter([
+            0.0,
+            2.0, 2.0, 2.0, 2.0,
+            6.0, 6.0, 6.0, 6.0,
+            14.0, 14.0,
+        ])
+
+        def clock():
+            return next(clock_values, 6.0)
+
+        guard = wrapper_windows._ComposerAdmissionGuard("codex")
+        injector = wrapper_windows._make_admitted_injector(
+            composer_guard=guard,
+            monotonic=clock,
+        )
+
+        def attempt(text, **_kwargs):
+            prompts.append(text)
+            if len(prompts) == 1:
+                with open(self.queue, "ab") as stream:
+                    stream.write(b'{"channel": "orchestration"}\n')
+                return {
+                    "status": "cancelled",
+                    "event": {
+                        "action": "injection-enter-cancelled",
+                        "fingerprint": "owned-watcher-batch",
+                    },
+                }
+            cursor_before_success.append(self._cursor_offset())
+            done.set()
+            return {"status": "injected"}
+
+        screens = {"count": 0}
+
+        def read_screen():
+            screens["count"] += 1
+            if screens["count"] <= 2:
+                return _codex_screen_with_text(prompts[0])
+            return CODEX_IDLE
+
+        with (
+            mock.patch.object(
+                wrapper_windows, "_injection_attempt", side_effect=attempt
+            ),
+            mock.patch.object(
+                wrapper_windows,
+                "_read_visible_console_text",
+                side_effect=read_screen,
+            ),
+            mock.patch.object(
+                wrapper_windows.kernel32, "GetStdHandle", return_value=123
+            ),
+            mock.patch.object(wrapper_windows, "_write_key") as write_key,
+            mock.patch.object(wrapper_windows.time, "sleep"),
+        ):
+            self._run_watcher(injector, done)
+
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("#lane-test1", prompts[0])
+        self.assertNotIn("#orchestration", prompts[0])
+        self.assertIn("#lane-test1", prompts[1])
+        self.assertIn("#orchestration", prompts[1])
+        self.assertEqual(cursor_before_success, [0])
+        self.assertEqual(write_key.call_count, 2)
+        self.assertTrue(all(
+            call.kwargs["vk"] == wrapper_windows.VK_ESCAPE
+            for call in write_key.call_args_list
+        ))
+
+        content = self.queue.read_bytes()
+        self.assertEqual(self._cursor_offset(), len(content))
+        journal = [
+            json.loads(line)
+            for line in wrapper._delivery_journal_path(
+                self.queue
+            ).read_text("utf-8").splitlines()
+        ]
+        self.assertEqual(
+            [record["state"] for record in journal],
+            [
+                "attempting", "retry", "attempting", "accepted",
+                "accepted", "accepted",
+            ],
+        )
+        self.assertEqual(journal[1]["inject_result"], "cancelled")
+        self.assertTrue(journal[-1]["cursor_committed"])
+
+    def test_retry_backoff_prevents_additional_journal_pairs(self):
+        payload = b'{"channel": "lane-test1"}\n'
+        self.queue.write_bytes(payload)
+        backoff_observed = threading.Event()
+
+        class BackedOffAfterFirstAttempt:
+            def __init__(self):
+                self.calls = 0
+                self.delay = 0.0
+
+            def __call__(self, _prompt):
+                self.calls += 1
+                self.delay = 30.0
+                return "deferred"
+
+            def retry_after(self):
+                if self.delay > 0.0:
+                    backoff_observed.set()
+                return self.delay
+
+            def recovery_probe(self):
+                if self.delay == 0.0:
+                    return True
+                raise AssertionError("probe must not run before deadline")
+
+        injector = BackedOffAfterFirstAttempt()
+        self._run_watcher(injector, backoff_observed)
+
+        journal = [
+            json.loads(line)
+            for line in wrapper._delivery_journal_path(
+                self.queue
+            ).read_text("utf-8").splitlines()
+        ]
+        self.assertEqual(injector.calls, 1)
+        self.assertEqual(
+            [record["state"] for record in journal],
+            ["attempting", "retry"],
+        )
+        self.assertEqual(self._cursor_offset(), 0)
 
     def test_crash_during_deferral_leaves_recoverable_queue(self):
         payload = b'{"channel": "lane-test1"}\n'

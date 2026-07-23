@@ -75,6 +75,19 @@ def _codex_screen_with_multiline_text(text: str) -> str:
     ])
 
 
+def _codex_screen_with_soft_wrapped_text(text: str, width: int = 48) -> str:
+    chunks = [text[index:index + width] for index in range(0, len(text), width)]
+    return "\n".join([
+        "codex banner",
+        "Worked for 2m 10s",
+        "",
+        "› " + chunks[0],
+        *("  " + chunk for chunk in chunks[1:]),
+        "",
+        "  gpt-5.6-sol xhigh · C:\\workspace",
+    ])
+
+
 def _fable_screen_with_text(text: str) -> str:
     return "\n".join([
         "✻ transcript output",
@@ -411,6 +424,24 @@ class TypedTextVisibleTests(unittest.TestCase):
             self._visible(post, provider="claude", pre=FABLE_IDLE)
         )
 
+    def test_long_soft_wrapped_codex_text_beyond_default_scan_passes(self):
+        text = "x" * 624
+        post = _codex_screen_with_soft_wrapped_text(text)
+        marker_row = post.splitlines().index("› " + text[:48])
+        self.assertLess(
+            marker_row,
+            len(post.splitlines()) - wrapper_windows._COMPOSER_SCAN_ROWS,
+        )
+        self.assertTrue(self._visible(post, text=text))
+
+    def test_long_matching_transcript_outside_tail_window_suppresses(self):
+        text = "x" * 624
+        stale = _codex_screen_with_soft_wrapped_text(text)
+        post = stale + "\n" + "\n".join(
+            f"new transcript row {index}" for index in range(12)
+        )
+        self.assertFalse(self._visible(post, text=text))
+
     def test_claude_atomic_paste_pill_after_empty_composer_passes(self):
         post = "\n".join([
             "transcript output",
@@ -437,6 +468,16 @@ class TypedTextVisibleTests(unittest.TestCase):
             "transcript output",
             f"❯{NBSP}[Pasted text from operator]",
             "status",
+        ])
+        self.assertFalse(
+            self._visible(post, provider="claude", pre=FABLE_IDLE)
+        )
+
+    def test_claude_stale_paste_pill_above_default_scan_suppresses(self):
+        post = "\n".join([
+            "transcript output",
+            f"❯{NBSP}[Pasted text #1]",
+            *(f"new transcript row {index}" for index in range(12)),
         ])
         self.assertFalse(
             self._visible(post, provider="claude", pre=FABLE_IDLE)
@@ -1078,6 +1119,116 @@ class InjectAttemptTests(unittest.TestCase):
             self.assertEqual(injector(text), "injected")
 
         self.assertEqual(attempt.call_count, 2)
+
+    def test_cancelled_codex_soft_wrap_provenance_clears_after_two_probes(self):
+        text = "x" * 624
+        wrapped_screen = _codex_screen_with_soft_wrapped_text(text)
+        blink_lines = wrapped_screen.splitlines()
+        blink_lines[-3] += "▌"
+        wrapped_blink_screen = "\n".join(blink_lines)
+        guard = wrapper_windows._ComposerAdmissionGuard("codex")
+
+        with (
+            mock.patch.object(
+                wrapper_windows,
+                "_read_visible_console_text",
+                side_effect=[CODEX_IDLE, wrapped_screen],
+            ),
+            mock.patch.object(
+                wrapper_windows, "_inject_unlocked", return_value=False
+            ),
+        ):
+            cancelled = wrapper_windows._injection_attempt(
+                text, composer_guard=guard, allow_active=True
+            )
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertIn("_owned_cancelled_rendered_proof", cancelled)
+        self.assertNotIn("x" * 40, json.dumps(cancelled["event"]))
+
+        now = [0.0]
+        injector = wrapper_windows._make_admitted_injector(
+            composer_guard=guard,
+            monotonic=lambda: now[0],
+        )
+        with (
+            mock.patch.object(
+                wrapper_windows,
+                "_injection_attempt",
+                side_effect=[cancelled, {"status": "injected"}],
+            ) as attempt,
+            mock.patch.object(
+                wrapper_windows,
+                "_read_visible_console_text",
+                side_effect=[
+                    wrapped_screen,
+                    wrapped_blink_screen,
+                    CODEX_IDLE,
+                    CODEX_IDLE,
+                ],
+            ),
+            mock.patch.object(
+                wrapper_windows.kernel32, "GetStdHandle", return_value=123
+            ),
+            mock.patch.object(wrapper_windows, "_write_key") as write_key,
+            mock.patch.object(wrapper_windows.time, "sleep"),
+        ):
+            self.assertEqual(injector(text), "cancelled")
+            now[0] = 2.0
+            self.assertEqual(injector(text), "deferred")
+            write_key.assert_not_called()
+            now[0] = 6.0
+            self.assertEqual(injector(text), "deferred")
+            self.assertEqual(write_key.call_count, 2)
+            now[0] = 14.0
+            self.assertEqual(injector(text), "injected")
+
+        self.assertEqual(attempt.call_count, 2)
+
+    def test_cancelled_codex_soft_wrap_edit_destroys_clear_provenance(self):
+        text = "x" * 624
+        wrapped_screen = _codex_screen_with_soft_wrapped_text(text)
+        edited_screen = wrapped_screen.replace(
+            "  " + text[48:96],
+            "  " + text[48:72] + " " + text[72:96],
+            1,
+        )
+        guard = wrapper_windows._ComposerAdmissionGuard("codex")
+        cancelled = {
+            "status": "cancelled",
+            "_owned_cancelled_screen": wrapped_screen,
+            "_owned_cancelled_rendered_proof": (
+                wrapper_windows._codex_cancelled_owned_rendered_proof(
+                    wrapped_screen, text, guard
+                )
+            ),
+            "event": {
+                "action": "injection-enter-cancelled",
+                "fingerprint": "wrapped-owned-edit",
+            },
+        }
+        now = [0.0]
+        injector = wrapper_windows._make_admitted_injector(
+            composer_guard=guard,
+            monotonic=lambda: now[0],
+        )
+        with (
+            mock.patch.object(
+                wrapper_windows, "_injection_attempt", return_value=cancelled
+            ) as attempt,
+            mock.patch.object(
+                wrapper_windows,
+                "_read_visible_console_text",
+                return_value=edited_screen,
+            ),
+            mock.patch.object(wrapper_windows, "_write_key") as write_key,
+        ):
+            self.assertEqual(injector(text), "cancelled")
+            for due in (2.0, 6.0, 14.0):
+                now[0] = due
+                self.assertEqual(injector(text), "deferred")
+
+        self.assertEqual(attempt.call_count, 1)
+        write_key.assert_not_called()
 
     def test_same_length_pill_without_immediate_cancel_provenance_is_rejected(self):
         text = "x" * 2303

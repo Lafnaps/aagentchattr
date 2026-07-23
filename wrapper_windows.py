@@ -307,11 +307,18 @@ def _injection_attempt(text: str, *, delay: float = 0.3,
             },
         }
     if enter_cancelled:
+        rendered_proof = _codex_cancelled_owned_rendered_proof(
+            cancelled_screen, text, composer_guard
+        )
         return {
             "status": "cancelled",
             # Private, in-memory provenance only. Callers emit only `event`;
             # this raw snapshot is never persisted or included in alerts.
             "_owned_cancelled_screen": cancelled_screen,
+            **(
+                {"_owned_cancelled_rendered_proof": rendered_proof}
+                if rendered_proof is not None else {}
+            ),
             "event": {
                 "action": "injection-enter-cancelled",
                 "classification": (
@@ -341,7 +348,8 @@ def _probe_injection_admission(*, safeguard_guard: bool,
                                allow_active: bool = False,
                                owned_text: str | None = None,
                                owned_clear_candidate: dict | None = None,
-                               owned_paste_proof: dict | None = None) -> dict:
+                               owned_paste_proof: dict | None = None,
+                               owned_rendered_proof: dict | None = None) -> dict:
     """Fail-closed recovery probe; never sends wrapper text or Enter.
 
     The same fail-closed ordering as _injection_attempt is used, but a
@@ -388,6 +396,7 @@ def _probe_injection_admission(*, safeguard_guard: bool,
                 composer_guard,
                 owned_clear_candidate,
                 owned_paste_proof=owned_paste_proof,
+                owned_rendered_proof=owned_rendered_proof,
             )
         else:
             clear_armed = False
@@ -406,6 +415,8 @@ def _probe_injection_admission(*, safeguard_guard: bool,
             # never reuse the same provenance on a later probe.
             if owned_paste_proof is not None:
                 owned_paste_proof.clear()
+            if owned_rendered_proof is not None:
+                owned_rendered_proof.clear()
             handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
             clear_error_type = None
             try:
@@ -516,6 +527,7 @@ def _make_admitted_injector(*, delay: float = 0.3,
     episode_owned_text = None
     owned_clear_candidate = {}
     owned_paste_proof = {}
+    owned_rendered_proof = {}
 
     def _schedule_probe(now: float, *, first: bool = False) -> None:
         nonlocal next_probe_at, probe_delay
@@ -534,6 +546,7 @@ def _make_admitted_injector(*, delay: float = 0.3,
         episode_owned_text = None
         owned_clear_candidate.clear()
         owned_paste_proof.clear()
+        owned_rendered_proof.clear()
 
     def _retry_after() -> float:
         if not blocked_episode:
@@ -553,6 +566,7 @@ def _make_admitted_injector(*, delay: float = 0.3,
         )
         owned_clear_candidate.clear()
         owned_paste_proof.clear()
+        owned_rendered_proof.clear()
         if episode_owned_text is not None:
             pill = _codex_cancelled_owned_paste_pill(
                 result.get("_owned_cancelled_screen"),
@@ -561,6 +575,9 @@ def _make_admitted_injector(*, delay: float = 0.3,
             )
             if pill is not None:
                 owned_paste_proof["pill"] = pill
+            rendered = result.get("_owned_cancelled_rendered_proof")
+            if isinstance(rendered, tuple) and rendered:
+                owned_rendered_proof["region"] = rendered
         _schedule_probe(clock(), first=True)
         if emit:
             # This is the single operator-facing notification for the
@@ -595,6 +612,7 @@ def _make_admitted_injector(*, delay: float = 0.3,
             owned_text=episode_owned_text,
             owned_clear_candidate=owned_clear_candidate,
             owned_paste_proof=owned_paste_proof,
+            owned_rendered_proof=owned_rendered_proof,
         )
         if result.get("owned_cleared"):
             # The stale exact-owned batch is gone. Keep the episode armed until
@@ -603,6 +621,7 @@ def _make_admitted_injector(*, delay: float = 0.3,
             episode_owned_text = None
             owned_clear_candidate.clear()
             owned_paste_proof.clear()
+            owned_rendered_proof.clear()
         if result["ready"]:
             _reset_blocked_episode()
             return True
@@ -1179,6 +1198,11 @@ def _read_visible_console_text(handle=None) -> str:
 # composer at the bottom of the viewport; hint/status rows below it do not
 # start with a composer marker, so the bottom-most marker row is the composer.
 _COMPOSER_SCAN_ROWS = 12
+# Exact post-type and cancellation-bound ownership checks may need to find the
+# composer marker above many soft-wrapped rows.  They remain tail-bound and
+# exact-text-bound, so this wider search is never used for ordinary empty
+# composer admission.
+_OWNED_COMPOSER_SCAN_ROWS = 64
 
 # Exact prompt markers that begin a composer row per provider CLI family.
 # Recognition is positive-only: a provider absent from this map can never be
@@ -1305,7 +1329,8 @@ def _nospace(text: str) -> str:
 
 def _composer_state(screen: str, markers: tuple, placeholders: tuple = (),
                     separator: str = " ",
-                    empty_requires_separator: bool = False):
+                    empty_requires_separator: bool = False,
+                    scan_rows: int = _COMPOSER_SCAN_ROWS):
     """Positively classify the provider composer from a screen snapshot.
 
     Returns (state, content, row_index) where state is one of:
@@ -1322,7 +1347,7 @@ def _composer_state(screen: str, markers: tuple, placeholders: tuple = (),
     if not markers:
         return "unrecognized", "", -1
     lines = screen.splitlines()
-    first_scanned = max(0, len(lines) - _COMPOSER_SCAN_ROWS)
+    first_scanned = max(0, len(lines) - max(1, int(scan_rows)))
     for index in range(len(lines) - 1, first_scanned - 1, -1):
         stripped = _strip_composer_row(lines[index])
         if not stripped:
@@ -1344,6 +1369,55 @@ def _composer_state(screen: str, markers: tuple, placeholders: tuple = (),
     return "unrecognized", "", -1
 
 
+def _typed_text_region(screen: str, text: str, composer_guard):
+    """Return the exact rendered composer row range for one owned text batch.
+
+    The marker may sit above the ordinary 12-row admission window when Codex
+    soft-wraps a long atomic input batch.  A wider search is safe here because
+    the complete expected text must reconstruct exactly and the final owned
+    row must still be in the ordinary low viewport.  Stale matching transcript
+    text above that tail window therefore cannot authorize Enter or Escape.
+    """
+    text_ns = _nospace(text)
+    if not text_ns:
+        return None
+    state, content, row = _composer_state(
+        screen,
+        composer_guard.markers,
+        composer_guard.placeholders,
+        composer_guard.separator,
+        composer_guard.empty_requires_separator,
+        scan_rows=_OWNED_COMPOSER_SCAN_ROWS,
+    )
+    if state != "nonempty" or row < 0:
+        return None
+
+    accumulated = _nospace(content)
+    if not text_ns.startswith(accumulated):
+        return None
+    lines = screen.splitlines()
+    end_row = row
+    if accumulated != text_ns:
+        for index, line in enumerate(lines[row + 1:], start=row + 1):
+            piece = _nospace(
+                _strip_composer_row(line).strip(_CURSOR_CELL_CHARS)
+            )
+            if not piece:
+                break
+            candidate = accumulated + piece
+            if not text_ns.startswith(candidate):
+                break  # row is not a continuation of our text (border/hints)
+            accumulated = candidate
+            end_row = index
+            if accumulated == text_ns:
+                break
+    if accumulated != text_ns:
+        return None
+    if len(lines) - end_row > _COMPOSER_SCAN_ROWS:
+        return None
+    return row, end_row
+
+
 def _typed_text_visible(post_screen: str, pre_screen, text: str,
                         composer_guard) -> bool:
     """Positive post-type preflight: Enter is allowed only when the composer
@@ -1358,17 +1432,13 @@ def _typed_text_visible(post_screen: str, pre_screen, text: str,
     """
     if pre_screen is not None and post_screen == pre_screen:
         return False
-    text_ns = _nospace(text)
-    if not text_ns:
-        return False
+    # Claude's opaque paste pill carries no exact-text reconstruction, so keep
+    # its legacy proof inside the ordinary low viewport. Only the direct exact
+    # text path below may use the wider, tail-bound owned-region search.
     state, content, row = _composer_state(
         post_screen, composer_guard.markers, composer_guard.placeholders,
         composer_guard.separator, composer_guard.empty_requires_separator,
     )
-    if state != "nonempty":
-        # empty (batch vanished) or unrecognized (no positive region
-        # binding — e.g. marker row scrolled out): never Enter.
-        return False
 
     # Claude Code may collapse one atomic WriteConsoleInputW text batch into
     # an exact paste pill instead of rendering the inserted characters.  The
@@ -1378,8 +1448,12 @@ def _typed_text_visible(post_screen: str, pre_screen, text: str,
     # *our* batch owns the composer.  Keep the match exact and provider-bound:
     # arbitrary bracketed text or a pill present before injection must never
     # authorize Enter.
-    if composer_guard.provider == "claude" and re.fullmatch(
+    if (
+        state == "nonempty"
+        and composer_guard.provider == "claude"
+        and re.fullmatch(
         r"\[Pasted text #\d+\]", content
+        )
     ):
         pre_state, _pre_content, _pre_row = _composer_state(
             pre_screen or "",
@@ -1390,21 +1464,7 @@ def _typed_text_visible(post_screen: str, pre_screen, text: str,
         )
         return pre_state == "empty"
 
-    accumulated = _nospace(content)
-    if not text_ns.startswith(accumulated):
-        return False
-    lines = post_screen.splitlines()
-    for line in lines[row + 1:]:
-        piece = _nospace(
-            _strip_composer_row(line).strip(_CURSOR_CELL_CHARS)
-        )
-        if not piece:
-            break
-        candidate = accumulated + piece
-        if not text_ns.startswith(candidate):
-            break  # row is not a continuation of our text (border/hints)
-        accumulated = candidate
-    return accumulated == text_ns
+    return _typed_text_region(post_screen, text, composer_guard) is not None
 
 
 def _owned_composer_text_is_exact(screen: str, text: str,
@@ -1485,10 +1545,70 @@ def _codex_cancelled_owned_paste_pill(screen, text: str,
     return content
 
 
+def _codex_cancelled_owned_rendered_proof(screen, text: str,
+                                           composer_guard):
+    """Capture a private exact rendered-region proof for cancelled Codex text.
+
+    Unlike generic recovery matching, this is created only from the immediate
+    private screen captured after an admitted atomic batch withheld Enter.  It
+    lets recovery recognize the same long soft-wrapped composer without
+    treating arbitrary matching text as wrapper-owned.
+    """
+    if (
+        not isinstance(screen, str)
+        or not isinstance(text, str)
+        or not text
+        or composer_guard is None
+        or composer_guard.provider != "codex"
+    ):
+        return None
+    region = _typed_text_region(screen, text, composer_guard)
+    if region is None:
+        return None
+    start, end = region
+    lines = screen.splitlines()
+    rendered = tuple(
+        _strip_composer_row(line).strip(_CURSOR_CELL_CHARS)
+        for line in lines[start:end + 1]
+    )
+    return rendered if rendered else None
+
+
+def _owned_rendered_region_stable(previous_screen: str, previous_region,
+                                   screen: str, region) -> bool:
+    """Require a stable full screen, tolerating only owned-region cursor cells."""
+    if previous_screen == screen:
+        return True
+    if (
+        not isinstance(previous_region, tuple)
+        or len(previous_region) != 2
+        or not isinstance(region, tuple)
+        or region != previous_region
+    ):
+        return False
+    start, end = region
+    previous_lines = previous_screen.splitlines()
+    lines = screen.splitlines()
+    if len(previous_lines) != len(lines):
+        return False
+    for index, (old, new) in enumerate(zip(previous_lines, lines)):
+        if old == new:
+            continue
+        if index < start or index > end:
+            return False
+        if (
+            _strip_composer_row(old).strip(_CURSOR_CELL_CHARS)
+            != _strip_composer_row(new).strip(_CURSOR_CELL_CHARS)
+        ):
+            return False
+    return True
+
+
 def _owned_clear_stability_observation(screen: str, text: str,
                                        composer_guard,
                                        candidate: dict | None,
-                                       owned_paste_proof: dict | None = None):
+                                       owned_paste_proof: dict | None = None,
+                                       owned_rendered_proof: dict | None = None):
     """Track an exact-owned clear candidate across due recovery probes.
 
     Return (exact, armed). Arming requires two consecutive exact observations
@@ -1507,6 +1627,7 @@ def _owned_clear_stability_observation(screen: str, text: str,
         composer_guard.placeholders,
         composer_guard.separator,
         composer_guard.empty_requires_separator,
+        scan_rows=_OWNED_COMPOSER_SCAN_ROWS,
     )
     direct_exact = _owned_composer_text_is_exact(
         screen, text, composer_guard
@@ -1522,6 +1643,20 @@ def _owned_clear_stability_observation(screen: str, text: str,
         owned_paste_pill is not None
         and current_paste_pill == owned_paste_pill
     )
+    current_rendered = _codex_cancelled_owned_rendered_proof(
+        screen, text, composer_guard
+    )
+    current_rendered_region = _typed_text_region(
+        screen, text, composer_guard
+    )
+    owned_rendered = (
+        owned_rendered_proof.get("region")
+        if owned_rendered_proof is not None else None
+    )
+    proven_rendered_exact = (
+        owned_rendered is not None
+        and current_rendered == owned_rendered
+    )
     if owned_paste_pill is not None and not (
         proven_paste_exact or direct_exact
     ):
@@ -1529,26 +1664,44 @@ def _owned_clear_stability_observation(screen: str, text: str,
         # An operator edit/count change destroys that one-shot provenance;
         # seeing the same pill later cannot resurrect it.
         owned_paste_proof.clear()
+    if owned_rendered is not None and not (
+        proven_rendered_exact or direct_exact
+    ):
+        # Width changes, redraws, or edits destroy the one-shot raw rendered
+        # provenance. A later lookalike may never resurrect it.
+        owned_rendered_proof.clear()
     if (
         state != "nonempty"
         or row < 0
-        or not (direct_exact or proven_paste_exact)
+        or not (direct_exact or proven_paste_exact or proven_rendered_exact)
     ):
         candidate.clear()
         return False, False
 
     previous_screen = candidate.get("screen")
     previous_row = candidate.get("row", -1)
+    previous_rendered_region = candidate.get("rendered_region")
     previous_hits = candidate.get("hits", 0)
-    stable = (
-        isinstance(previous_screen, str)
-        and composer_guard._stable_against(
+    stable = isinstance(previous_screen, str) and (
+        _owned_rendered_region_stable(
+            previous_screen,
+            previous_rendered_region,
+            screen,
+            current_rendered_region,
+        )
+        if proven_rendered_exact else
+        composer_guard._stable_against(
             previous_screen, previous_row, screen, row
         )
     )
     hits = previous_hits + 1 if stable else 1
     candidate.clear()
-    candidate.update({"screen": screen, "row": row, "hits": hits})
+    candidate.update({
+        "screen": screen,
+        "row": row,
+        "rendered_region": current_rendered_region,
+        "hits": hits,
+    })
     return True, hits >= 2
 
 

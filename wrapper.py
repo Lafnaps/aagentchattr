@@ -1349,6 +1349,66 @@ def _coalesce_trigger_prompt(triggers: list[dict]) -> str:
     )
 
 
+_MAX_DELIVERY_BATCH_EVENTS = 6
+_MAX_DELIVERY_BATCH_BASE_CHARS = 1024
+
+
+def _bounded_trigger_prefix(queue_file: Path, triggers: list[dict],
+                            record_offsets: list[int], snapshot_end: int,
+                            raw: bytes, *,
+                            max_events: int = _MAX_DELIVERY_BATCH_EVENTS,
+                            max_base_chars: int =
+                                _MAX_DELIVERY_BATCH_BASE_CHARS):
+    """Select one bounded FIFO prefix and its exact queue consume boundary.
+
+    The rendered base prompt includes both the coalesced instruction and the
+    delivery envelope. At most ``max_events`` are represented and the prefix
+    stops before adding an event that would exceed ``max_base_chars``. One
+    oversize head record is always selected so a valid queue can make progress.
+    The returned snapshot end is either the original complete-line boundary or
+    the absolute start of the next record, which is itself a line boundary.
+    """
+    if not triggers:
+        return triggers, record_offsets, snapshot_end
+    if len(triggers) != len(record_offsets):
+        raise ValueError("trigger/offset cardinality mismatch")
+    event_limit = max(1, int(max_events))
+    char_limit = max(1, int(max_base_chars))
+    selected_count = 0
+    for count in range(1, min(len(triggers), event_limit) + 1):
+        candidate = _prepare_delivery_events(
+            queue_file, triggers[:count], record_offsets[:count]
+        )
+        rendered = (
+            _coalesce_trigger_prompt(candidate)
+            + "\n\n"
+            + _delivery_envelope(candidate)
+        )
+        if count > 1 and len(rendered) > char_limit:
+            break
+        selected_count = count
+        if len(rendered) > char_limit:
+            break  # the mandatory one-record oversize prefix
+
+    selected_end = (
+        int(snapshot_end)
+        if selected_count == len(triggers)
+        else int(record_offsets[selected_count])
+    )
+    if (
+        selected_count < 1
+        or selected_end <= 0
+        or selected_end > len(raw)
+        or raw[selected_end - 1:selected_end] != b"\n"
+    ):
+        raise ValueError("bounded trigger prefix is not a queue line boundary")
+    return (
+        triggers[:selected_count],
+        record_offsets[:selected_count],
+        selected_end,
+    )
+
+
 # Only a positive worker-side injector acknowledgement consumes a batch.
 # This is not an end-to-end CLI semantic ACK; it proves only that the injector
 # positively completed text+Enter.  Ambiguous/legacy results remain durable.
@@ -1541,6 +1601,13 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                 triggers, malformed, record_offsets = (
                     ([], 0, []) if status != "ok"
                     else _parse_trigger_records(pending, pending_start)
+                )
+
+            if status == "ok" and not malformed and triggers:
+                triggers, record_offsets, snapshot_end = (
+                    _bounded_trigger_prefix(
+                        queue0, triggers, record_offsets, snapshot_end, raw
+                    )
                 )
 
             if status == "corrupt" or malformed:

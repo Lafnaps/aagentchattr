@@ -1890,6 +1890,106 @@ class CoalesceRepresentationTests(unittest.TestCase):
         self.assertEqual(prompt.count("#a"), 1)
 
 
+class BoundedTriggerPrefixTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.queue = Path(self._tmp.name) / "agent_queue.jsonl"
+
+    def _snapshot(self, records):
+        raw = b"".join(
+            (json.dumps(record, separators=(",", ":")) + "\n").encode()
+            for record in records
+        )
+        self.queue.write_bytes(raw)
+        status, pending, end, snapshot = wrapper._read_pending_triggers(
+            self.queue
+        )
+        triggers, malformed, offsets = wrapper._parse_trigger_records(
+            pending, 0
+        )
+        self.assertEqual((status, malformed), ("ok", 0))
+        return triggers, offsets, end, snapshot
+
+    @staticmethod
+    def _identified(index, **extra):
+        return {
+            "channel": "general",
+            "event_id": f"evt-{index:032x}",
+            "action_id": f"act-{index:064x}",
+            **extra,
+        }
+
+    def test_event_limit_returns_six_record_fifo_line_boundary(self):
+        snapshot = self._snapshot([
+            self._identified(index) for index in range(1, 9)
+        ])
+        triggers, offsets, end = wrapper._bounded_trigger_prefix(
+            self.queue, *snapshot
+        )
+        self.assertEqual(len(triggers), 6)
+        self.assertEqual(len(offsets), 6)
+        self.assertEqual(end, snapshot[1][6])
+        self.assertEqual(snapshot[3][end - 1:end], b"\n")
+        self.assertEqual(
+            [event["event_id"] for event in triggers],
+            [f"evt-{index:032x}" for index in range(1, 7)],
+        )
+
+    def test_char_limit_stops_before_second_and_one_oversize_progresses(self):
+        for prompt_size in (400, 1200):
+            with self.subTest(prompt_size=prompt_size):
+                snapshot = self._snapshot([
+                    self._identified(1, prompt="x" * prompt_size),
+                    self._identified(2, prompt="y" * prompt_size),
+                ])
+                triggers, offsets, end = wrapper._bounded_trigger_prefix(
+                    self.queue, *snapshot
+                )
+                self.assertEqual(len(triggers), 1)
+                self.assertEqual(end, snapshot[1][1])
+                prepared = wrapper._prepare_delivery_events(
+                    self.queue, triggers, offsets
+                )
+                rendered = (
+                    wrapper._coalesce_trigger_prompt(prepared)
+                    + "\n\n"
+                    + wrapper._delivery_envelope(prepared)
+                )
+                if prompt_size == 1200:
+                    self.assertGreater(
+                        len(rendered),
+                        wrapper._MAX_DELIVERY_BATCH_BASE_CHARS,
+                    )
+
+    def test_legacy_ids_remain_absolute_across_bounded_prefixes(self):
+        snapshot = self._snapshot([
+            {"channel": "general", "text": f"legacy-{index}"}
+            for index in range(8)
+        ])
+        full = wrapper._prepare_delivery_events(
+            self.queue, snapshot[0], snapshot[1]
+        )
+        first, first_offsets, end = wrapper._bounded_trigger_prefix(
+            self.queue, *snapshot
+        )
+        prepared_first = wrapper._prepare_delivery_events(
+            self.queue, first, first_offsets
+        )
+        suffix = snapshot[3][end:].decode("utf-8")
+        rest, malformed, rest_offsets = wrapper._parse_trigger_records(
+            suffix, end
+        )
+        self.assertEqual(malformed, 0)
+        prepared_rest = wrapper._prepare_delivery_events(
+            self.queue, rest, rest_offsets
+        )
+        self.assertEqual(
+            [event["event_id"] for event in prepared_first + prepared_rest],
+            [event["event_id"] for event in full],
+        )
+
+
 class WatcherDurabilityTests(unittest.TestCase):
     """_queue_watcher: consume-on-success only, coalesce during deferral,
     fetch-failure deferral (H4), identity generation (H5), quarantine (M)."""
@@ -1959,6 +2059,108 @@ class WatcherDurabilityTests(unittest.TestCase):
         self.assertIn(b"lane-test1", content)
         self.assertIn(b"orchestration", content)
         self.assertEqual(self._cursor_offset(), len(content))
+
+    def test_bounded_fifo_batches_drain_without_loss(self):
+        records = [
+            {
+                "channel": "general",
+                "event_id": f"evt-{index:032x}",
+                "action_id": f"act-{index:064x}",
+            }
+            for index in range(1, 9)
+        ]
+        self.queue.write_bytes(b"".join(
+            (json.dumps(record, separators=(",", ":")) + "\n").encode()
+            for record in records
+        ))
+        prompts = []
+        done = threading.Event()
+
+        def inject_fn(prompt):
+            prompts.append(prompt)
+            if len(prompts) == 2:
+                done.set()
+            return "injected"
+
+        self._run_watcher(inject_fn, done)
+
+        envelopes = [
+            json.loads(prompt.split("DELIVERY_ENVELOPE=", 1)[1])
+            for prompt in prompts
+        ]
+        self.assertEqual(
+            [len(envelope["event_ids"]) for envelope in envelopes], [6, 2]
+        )
+        self.assertEqual(
+            [event_id for envelope in envelopes
+             for event_id in envelope["event_ids"]],
+            [record["event_id"] for record in records],
+        )
+        self.assertEqual(self._cursor_offset(), len(self.queue.read_bytes()))
+        journal = [
+            json.loads(line)
+            for line in wrapper._delivery_journal_path(
+                self.queue
+            ).read_text("utf-8").splitlines()
+        ]
+        self.assertEqual(
+            [len(record["event_ids"]) for record in journal
+             if record["state"] == "attempting"],
+            [6, 2],
+        )
+
+    def test_deferred_bounded_prefix_does_not_absorb_tail_appends(self):
+        records = [
+            {
+                "channel": "general",
+                "event_id": f"evt-{index:032x}",
+                "action_id": f"act-{index:064x}",
+            }
+            for index in range(1, 8)
+        ]
+        initial = b"".join(
+            (json.dumps(record, separators=(",", ":")) + "\n").encode()
+            for record in records
+        )
+        self.queue.write_bytes(initial)
+        observed = threading.Event()
+        prompts = []
+
+        class DeferredOnce:
+            def __init__(inner_self):
+                inner_self.called = False
+
+            def __call__(inner_self, prompt):
+                prompts.append(prompt)
+                inner_self.called = True
+                appended = {
+                    "channel": "owner-telegram",
+                    "event_id": f"evt-{8:032x}",
+                    "action_id": f"act-{8:064x}",
+                }
+                with open(self.queue, "ab") as stream:
+                    stream.write(
+                        (json.dumps(appended, separators=(",", ":")) + "\n")
+                        .encode()
+                    )
+                observed.set()
+                return "deferred"
+
+            def retry_after(inner_self):
+                return 30.0 if inner_self.called else 0.0
+
+        self._run_watcher(DeferredOnce(), observed)
+
+        self.assertEqual(len(prompts), 1)
+        envelope = json.loads(
+            prompts[0].split("DELIVERY_ENVELOPE=", 1)[1]
+        )
+        self.assertEqual(
+            envelope["event_ids"],
+            [record["event_id"] for record in records[:6]],
+        )
+        self.assertEqual(self._cursor_offset(), 0)
+        self.assertEqual(len(self.queue.read_bytes().splitlines()), 8)
 
     @unittest.skipUnless(sys.platform == "win32", "Windows-only injection gate")
     def test_cancelled_owned_recovery_recoalesces_without_retry_spam(self):

@@ -134,7 +134,7 @@ class RouteHelperTests(unittest.TestCase):
             telegram_route.resolve_telegram_reply_to(
                 unrelated, resolve, preceding_request=owner
             ),
-            TELEGRAM_MESSAGE_ID,
+            None,
         )
 
     def test_telegram_message_id_normalization_is_positive_integer_only(self):
@@ -274,11 +274,15 @@ class RouteHttpContractTests(unittest.TestCase):
         entry = body["messages"][0]
         self.assertEqual(set(entry), {"id", "sender", "recipient",
                                       "correlation_id", "reply_to_message_id",
-                                      "text", "channel"})
+                                      "text", "channel", "type",
+                                      "decision_id", "choices"})
         self.assertEqual(entry["recipient"], "owner-telegram")
         self.assertEqual(entry["sender"], "codex-sol")
         self.assertEqual(entry["correlation_id"], "tg-9")
         self.assertEqual(entry["reply_to_message_id"], TELEGRAM_MESSAGE_ID)
+        self.assertEqual(entry["type"], "chat")
+        self.assertIsNone(entry["decision_id"])
+        self.assertEqual(entry["choices"], [])
         self.assertEqual(body["cursor"], entry["id"])
 
     # --- two-factor gate + every one-factor negative ---
@@ -800,9 +804,10 @@ class OutboundOrdinaryResponseTests(unittest.TestCase):
         self.assertEqual(entry["sender"], "codex-sol")
         self.assertEqual(entry["recipient"], "owner-telegram")
         self.assertEqual(entry["text"], "plain answer")
-        # Correlation inherited from the preceding owner request.
+        # Correlation remains the existing sequential contract, but Telegram
+        # reply binding is explicit-only.
         self.assertEqual(entry["correlation_id"], "tg-ord")
-        self.assertEqual(entry["reply_to_message_id"], TELEGRAM_MESSAGE_ID)
+        self.assertIsNone(entry["reply_to_message_id"])
 
     def test_multiple_sequential_pairs_map_deterministically(self):
         self._inbound("q1", 5101)                                      # id 0
@@ -814,7 +819,7 @@ class OutboundOrdinaryResponseTests(unittest.TestCase):
         self.assertEqual(got, {"ans1": "q1", "ans2": "q2"})
         reply_targets = {e["text"]: e["reply_to_message_id"]
                          for e in self._outbound()["messages"]}
-        self.assertEqual(reply_targets, {"ans1": 5101, "ans2": 5102})
+        self.assertEqual(reply_targets, {"ans1": None, "ans2": None})
 
     def test_explicit_reply_takes_precedence_over_sequential_rule(self):
         self._inbound("e1", 5201)                                      # id 0

@@ -549,46 +549,98 @@ class MessageStore:
                 return None, None, ("already resolved", 400)
             valid_choices = metadata.get("choices", [])
             if valid_choices and chosen not in valid_choices:
-                return None, None, (f"invalid choice. Valid: {valid_choices}", 400)
+                return None, None, ("invalid choice", 400)
 
-            messages_before = copy.deepcopy(self._messages)
-            next_id_before = self._next_id
-            sender = message.get("sender", "")
-            channel = message.get("channel", "general")
-            metadata["resolved"] = True
-            metadata["chosen"] = chosen
-            message["metadata"] = metadata
+            updated, reply_result = self._resolve_decision_locked(
+                message, metadata, chosen, username
+            )
 
-            timestamp = time.time()
-            reply = {
-                "id": self._next_id,
-                "uid": str(uuid.uuid4()),
-                "sender": username,
-                "text": f"@{sender} {chosen}" if sender else chosen,
-                "type": "chat",
-                "timestamp": timestamp,
-                "time": time.strftime("%H:%M:%S"),
-                "attachments": [],
-                "channel": channel,
-                "reply_to": msg_id,
-            }
-            self._next_id += 1
-            self._messages.append(reply)
-            try:
-                self._rewrite_jsonl()
-            except Exception:
-                self._messages = messages_before
-                self._next_id = next_id_before
-                raise
-            updated = copy.deepcopy(message)
-            reply_result = copy.deepcopy(reply)
+        self._notify_decision_reply(reply_result)
+        return updated, reply_result, None
 
+    def resolve_decision_index(
+        self, msg_id: int, choice_index: int, username: str
+    ) -> tuple[dict | None, dict | None, tuple[str, int] | None]:
+        """Resolve using the decision's current server-side choice list.
+
+        The index lookup and the durable decision+reply rewrite share the store
+        lock, so a caller can never race an edit and submit stale choice text.
+        Choice text is never accepted from the wire.
+        """
+        with self._lock:
+            self._assert_writable_locked()
+            message = next((m for m in self._messages if m["id"] == msg_id), None)
+            if message is None:
+                return None, None, ("message not found", 404)
+            if message.get("type") != "decision":
+                return None, None, ("not a decision message", 400)
+            metadata = copy.deepcopy(message.get("metadata") or {})
+            if metadata.get("resolved"):
+                return None, None, ("already resolved", 409)
+            valid_choices = metadata.get("choices")
+            if (
+                isinstance(choice_index, bool)
+                or not isinstance(choice_index, int)
+                or not isinstance(valid_choices, list)
+                or choice_index < 0
+                or choice_index >= len(valid_choices)
+            ):
+                return None, None, ("invalid choice", 400)
+            chosen = valid_choices[choice_index]
+            if not isinstance(chosen, str) or not chosen.strip():
+                return None, None, ("invalid choice", 400)
+
+            updated, reply_result = self._resolve_decision_locked(
+                message, metadata, chosen, username
+            )
+
+        self._notify_decision_reply(reply_result)
+        return updated, reply_result, None
+
+    def _resolve_decision_locked(
+        self, message: dict, metadata: dict, chosen: str, username: str
+    ) -> tuple[dict, dict]:
+        """Commit one validated decision while ``self._lock`` is held."""
+        msg_id = message["id"]
+
+        messages_before = copy.deepcopy(self._messages)
+        next_id_before = self._next_id
+        sender = message.get("sender", "")
+        channel = message.get("channel", "general")
+        metadata["resolved"] = True
+        metadata["chosen"] = chosen
+        message["metadata"] = metadata
+
+        timestamp = time.time()
+        reply = {
+            "id": self._next_id,
+            "uid": str(uuid.uuid4()),
+            "sender": username,
+            "text": f"@{sender} {chosen}" if sender else chosen,
+            "type": "chat",
+            "timestamp": timestamp,
+            "time": time.strftime("%H:%M:%S"),
+            "attachments": [],
+            "channel": channel,
+            "reply_to": msg_id,
+        }
+        self._next_id += 1
+        self._messages.append(reply)
+        try:
+            self._rewrite_jsonl()
+        except Exception:
+            self._messages = messages_before
+            self._next_id = next_id_before
+            raise
+        return copy.deepcopy(message), copy.deepcopy(reply)
+
+    def _notify_decision_reply(self, reply_result: dict) -> None:
+        """Run normal new-message callbacks after a committed decision reply."""
         for callback in self._callbacks:
             try:
                 callback(copy.deepcopy(reply_result))
             except Exception:
                 pass
-        return updated, reply_result, None
 
     def _rewrite_jsonl(self):
         """Rewrite the JSONL file from current in-memory messages."""

@@ -2878,6 +2878,67 @@ async def api_telegram_inbound(request: Request):
     })
 
 
+@app.post("/api/telegram/decisions/resolve")
+async def api_telegram_resolve_decision(request: Request):
+    """Resolve one Telegram inline decision by opaque id + choice index.
+
+    The same route bearer and actual Telegram user/chat allowlist pair are both
+    required.  Choice text is looked up under the message-store lock and never
+    accepted from or returned to the bridge.  Replays are successful no-ops, so
+    a lost callback acknowledgement or a restart cannot append a second owner
+    reply.
+    """
+    guard = telegram_route_guard
+    bearer = _telegram_bearer(request)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid request"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid request"}, status_code=400)
+
+    user_id = telegram_route.normalize_tg_id(body.get("telegram_user_id"))
+    chat_id = telegram_route.normalize_tg_id(body.get("telegram_chat_id"))
+    if guard is None or not guard.verify_inbound(bearer, user_id, chat_id):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    if set(body) != {
+        "decision_id", "choice_index", "telegram_user_id", "telegram_chat_id"
+    }:
+        return JSONResponse({"error": "invalid request"}, status_code=400)
+    decision_id = body.get("decision_id")
+    choice_index = body.get("choice_index")
+    telegram_user_id = body.get("telegram_user_id")
+    telegram_chat_id = body.get("telegram_chat_id")
+    if (
+        isinstance(decision_id, bool)
+        or not isinstance(decision_id, int)
+        or decision_id < 0
+        or len(str(decision_id)) > telegram_route.MAX_DECISION_ID_DIGITS
+        or isinstance(choice_index, bool)
+        or not isinstance(choice_index, int)
+        or not 0 <= choice_index < telegram_route.MAX_DECISION_CHOICES
+        or isinstance(telegram_user_id, bool)
+        or not isinstance(telegram_user_id, int)
+        or isinstance(telegram_chat_id, bool)
+        or not isinstance(telegram_chat_id, int)
+    ):
+        return JSONResponse({"error": "invalid request"}, status_code=400)
+    if store is None:
+        return JSONResponse({"error": "unavailable"}, status_code=503)
+
+    updated, _reply, error = store.resolve_decision_index(
+        decision_id, choice_index, telegram_route.OWNER_IDENTITY
+    )
+    if error:
+        if error[0] == "already resolved":
+            return JSONResponse({"status": "already_resolved"})
+        return JSONResponse({"error": "invalid request"}, status_code=error[1])
+    if updated:
+        await _broadcast(json.dumps({"type": "message_update", "message": updated}))
+    return JSONResponse({"status": "resolved"})
+
+
 @app.get("/api/telegram/outbound")
 async def api_telegram_outbound(request: Request):
     """Bounded loopback egress for the Telegram owner bridge (L-CHATT 5-6).
@@ -2940,7 +3001,7 @@ async def api_telegram_outbound(request: Request):
             message, store.get_by_id, preceding_request=preceding
         )
         reply_to_message_id = telegram_route.resolve_telegram_reply_to(
-            message, store.get_by_id, preceding_request=preceding
+            message, store.get_by_id
         )
         entries.append(telegram_route.outbound_entry(
             message, correlation_id, reply_to_message_id

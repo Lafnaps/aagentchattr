@@ -58,6 +58,12 @@ _RECIPIENT_ALIASES = {
     "codex": CANONICAL_RESPONDER,
 }
 
+# Telegram inline decision controls are intentionally bounded.  The callback
+# carries only the durable message id and a zero-based index; choice text never
+# crosses back from the bridge when a button is pressed.
+MAX_DECISION_CHOICES = 100
+MAX_DECISION_ID_DIGITS = 20
+
 
 def canonicalize_recipient(value: object) -> str | None:
     """Resolve a recipient token to the canonical responder, or ``None``.
@@ -302,21 +308,53 @@ def resolve_telegram_reply_to(message: dict, resolve_reply,
                               preceding_request: dict | None = None) -> int | None:
     """Resolve the Telegram message id an outbound response should quote.
 
-    An explicit reply to an owner message wins. Otherwise the ordinary
-    dedicated-channel response quotes the most recent preceding owner request.
-    Only the positive integer stored by authenticated Telegram ingress is
-    accepted; no id is inferred or fabricated.
+    Only an explicit agentchattr ``reply_to`` to an owner-authored message can
+    bind a Telegram reply.  ``preceding_request`` remains an ignored compatibility
+    argument for callers compiled against the earlier helper signature; it must
+    never be used to infer a reply target.  Only the positive integer stored by
+    authenticated Telegram ingress is accepted; no id is inferred or fabricated.
     """
-    parent = None
+    del preceding_request
     reply_id = message.get("reply_to")
-    if reply_id is not None:
-        candidate = resolve_reply(reply_id)
-        if candidate and candidate.get("sender") == OWNER_IDENTITY:
-            parent = candidate
-    if parent is None:
-        parent = preceding_request
+    if reply_id is None:
+        return None
+    parent = resolve_reply(reply_id)
+    if not parent or parent.get("sender") != OWNER_IDENTITY:
+        return None
     metadata = (parent or {}).get("metadata") or {}
     return normalize_tg_message_id(metadata.get("telegram_message_id"))
+
+
+def unresolved_decision_fields(message: dict) -> tuple[int | None, list[str]]:
+    """Return bounded wire fields for one unresolved decision, else no fields.
+
+    The route never forwards ``metadata.chosen``.  Choices are exposed only for
+    a currently unresolved decision with a compact non-negative integer id and
+    one to :data:`MAX_DECISION_CHOICES` non-empty string choices.  A malformed
+    stored decision is relayed as ordinary text rather than emitting malformed
+    inline controls.
+    """
+    if message.get("type") != "decision":
+        return None, []
+    metadata = message.get("metadata")
+    if not isinstance(metadata, dict) or metadata.get("resolved") is True:
+        return None, []
+    decision_id = message.get("id")
+    if (
+        isinstance(decision_id, bool)
+        or not isinstance(decision_id, int)
+        or decision_id < 0
+        or len(str(decision_id)) > MAX_DECISION_ID_DIGITS
+    ):
+        return None, []
+    choices = metadata.get("choices")
+    if (
+        not isinstance(choices, list)
+        or not 1 <= len(choices) <= MAX_DECISION_CHOICES
+        or any(not isinstance(choice, str) or not choice.strip() for choice in choices)
+    ):
+        return None, []
+    return decision_id, list(choices)
 
 
 def outbound_entry(message: dict, correlation_id: str | None,
@@ -326,6 +364,7 @@ def outbound_entry(message: dict, correlation_id: str | None,
     Explicitly carries the monotonic message-id cursor, the canonical
     recipient, the preserved correlation id, sender, channel and text.
     """
+    decision_id, choices = unresolved_decision_fields(message)
     return {
         "id": message.get("id"),
         "sender": message.get("sender"),
@@ -334,6 +373,9 @@ def outbound_entry(message: dict, correlation_id: str | None,
         "reply_to_message_id": reply_to_message_id,
         "text": message.get("text", ""),
         "channel": message.get("channel", ROUTE_CHANNEL),
+        "type": "decision" if decision_id is not None else "chat",
+        "decision_id": decision_id,
+        "choices": choices,
     }
 
 

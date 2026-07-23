@@ -23,6 +23,9 @@ NOT a parallel message system.  The bridge must use ONLY these paths:
   ``codex-sol`` reply is delivered without any fabricated recipient/reply/
   metadata; paging is lossless (ascending scan, at most ``limit`` per page,
   ``cursor`` = last covered id — no skip/reorder/duplicate).
+* ``POST /api/telegram/decisions/resolve`` — resolve an unresolved decision by
+  bounded opaque ``decision_id`` + ``choice_index`` under the same two-factor
+  gate.  The current choice is looked up server-side and a replay is a no-op.
 
 NOTE: :func:`build_contract_harness` mutates the process-wide ``app`` singleton
 (there is one server per process).  Always call :meth:`RouteContractHarness.close`
@@ -45,6 +48,7 @@ from store import MessageStore
 
 INBOUND_PATH = "/api/telegram/inbound"
 OUTBOUND_PATH = "/api/telegram/outbound"
+DECISION_RESOLVE_PATH = "/api/telegram/decisions/resolve"
 
 CANONICAL_RESPONDER = telegram_route.CANONICAL_RESPONDER   # "codex-sol"
 OWNER_IDENTITY = telegram_route.OWNER_IDENTITY             # "owner-telegram"
@@ -107,6 +111,20 @@ def example_outbound_response(*, messages: list[dict] | None = None,
     forward polling never rescans, skips or reorders a reply.
     """
     return {"messages": messages or [], "cursor": cursor}
+
+
+def example_decision_request(
+    *, decision_id: int = 7, choice_index: int = 0,
+    telegram_user_id: int = 100200300,
+    telegram_chat_id: int = 100200300,
+) -> dict:
+    """Exact callback-resolution body; it intentionally contains no choice text."""
+    return {
+        "decision_id": decision_id,
+        "choice_index": choice_index,
+        "telegram_user_id": telegram_user_id,
+        "telegram_chat_id": telegram_chat_id,
+    }
 
 
 class RouteContractHarness:

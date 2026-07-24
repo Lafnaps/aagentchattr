@@ -1440,19 +1440,29 @@ def _typed_text_visible(post_screen: str, pre_screen, text: str,
         composer_guard.separator, composer_guard.empty_requires_separator,
     )
 
-    # Claude Code may collapse one atomic WriteConsoleInputW text batch into
-    # an exact paste pill instead of rendering the inserted characters.  The
-    # input records were already confirmed as a complete batch by
-    # _write_text_batch; when the immediately preceding screen positively
-    # showed an empty provider composer, this pill is positive evidence that
-    # *our* batch owns the composer.  Keep the match exact and provider-bound:
-    # arbitrary bracketed text or a pill present before injection must never
-    # authorize Enter.
+    # Provider CLIs may collapse one atomic WriteConsoleInputW text batch into
+    # a paste pill instead of rendering the inserted characters. The input
+    # records were already confirmed as one complete batch; when the
+    # immediately preceding screen positively showed an empty provider
+    # composer, the provider's exact pill is positive evidence that *our*
+    # batch owns the composer. Codex additionally exposes the exact character
+    # count, which must equal Python len(text). Keep both matches exact and
+    # provider-bound: arbitrary bracketed text, a wrong count, or a pill
+    # present before injection must never authorize Enter.
     if (
         state == "nonempty"
-        and composer_guard.provider == "claude"
-        and re.fullmatch(
-        r"\[Pasted text #\d+\]", content
+        and (
+            (
+                composer_guard.provider == "claude"
+                and re.fullmatch(r"\[Pasted text #\d+\]", content)
+            )
+            or (
+                composer_guard.provider == "codex"
+                and bool(text)
+                and (match := _CODEX_PASTED_CONTENT_PILL.fullmatch(content))
+                is not None
+                and match.group(1) == str(len(text))
+            )
         )
     ):
         pre_state, _pre_content, _pre_row = _composer_state(

@@ -376,7 +376,8 @@ class TypedTextVisibleTests(unittest.TestCase):
 
     def _visible(self, post, provider="codex", pre=CODEX_IDLE, text=None):
         return wrapper_windows._typed_text_visible(
-            post, pre, text or self.TEXT, self._guard(provider)
+            post, pre, self.TEXT if text is None else text,
+            self._guard(provider),
         )
 
     def test_exact_text_in_composer_passes(self):
@@ -481,6 +482,38 @@ class TypedTextVisibleTests(unittest.TestCase):
         ])
         self.assertFalse(
             self._visible(post, provider="claude", pre=FABLE_IDLE)
+        )
+
+    def test_codex_atomic_paste_pill_exact_count_after_empty_passes(self):
+        text = "x" * 1766
+        post = _codex_screen_with_text("[Pasted Content 1766 chars]")
+        self.assertTrue(self._visible(post, text=text))
+
+    def test_codex_paste_pill_requires_empty_pre_and_exact_count(self):
+        text = "x" * 1766
+        exact = _codex_screen_with_text("[Pasted Content 1766 chars]")
+        self.assertFalse(self._visible(
+            exact,
+            pre=_codex_screen_with_text("operator draft"),
+            text=text,
+        ))
+        for mutant in (
+            "[Pasted Content 1765 chars]",
+            "[Pasted Content 01766 chars]",
+            "[Pasted Content 1766 chars] operator draft",
+            "[Pasted content 1766 chars]",
+        ):
+            with self.subTest(mutant=mutant):
+                self.assertFalse(
+                    self._visible(_codex_screen_with_text(mutant), text=text)
+                )
+
+    def test_codex_zero_length_paste_pill_cannot_prove_batch_ownership(self):
+        self.assertFalse(
+            self._visible(
+                _codex_screen_with_text("[Pasted Content 0 chars]"),
+                text="",
+            )
         )
 
     def test_vanished_text_or_unrecognized_composer_suppresses(self):
@@ -691,6 +724,27 @@ class InjectAttemptTests(unittest.TestCase):
         self.assertEqual(
             [(down) for _c, down, _vk in enter_batches[0]], [True, False]
         )
+
+    def test_stable_empty_codex_paste_pill_sends_single_enter(self):
+        text = "x" * 1766
+        guard = wrapper_windows._ComposerAdmissionGuard("codex")
+        calls = []
+        first = self._attempt(text, [CODEX_IDLE], guard, calls)
+        self.assertEqual(first["status"], "deferred")
+        second = self._attempt(
+            text,
+            [CODEX_IDLE, _codex_screen_with_text(
+                "[Pasted Content 1766 chars]"
+            )],
+            guard,
+            calls,
+        )
+        self.assertEqual(second["status"], "injected")
+        enter_batches = [
+            batch for batch in calls
+            if batch and batch[0][2] == wrapper_windows.VK_RETURN
+        ]
+        self.assertEqual(len(enter_batches), 1)
 
     def test_owner_interrupt_injects_during_active_codex_turn(self):
         text = "use mcp to read #owner-telegram - owner interrupt"

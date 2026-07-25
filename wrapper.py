@@ -430,10 +430,17 @@ def _auth_headers(token: str, *, include_json: bool = False) -> dict[str, str]:
 
 
 _RESTART_HANDOFF_PROFILES = {
+    # Legacy identities: retained as migration input aliases only (OD-001).
     "fable-main": "claude-main",
     "fable-work": "claude-work",
     "fable-infra": "claude-test1",
     "fable-emu": "claude-test2",
+    # Canonical identities (<account>-<model>, OD-001, since 2026-07-20).
+    "claude-fable": "claude-main",
+    "claude-work-fable": "claude-work",
+    "claude-test1-fable": "claude-test1",
+    "claude-test2-fable": "claude-test2",
+    "claude-test3-fable": "claude-test3",
 }
 _RESTART_HANDOFF_KEYS = {
     "profile", "internal_id", "identity_id", "epoch", "token", "expiry", "nonce",

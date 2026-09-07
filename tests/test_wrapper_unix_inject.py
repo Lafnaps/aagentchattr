@@ -1,50 +1,45 @@
-"""Tests for wrapper_unix.inject tri-state result contract.
-
-inject() must report "deferred" only when tmux rejected the text command
-(retry is safe), and "injected-uncertain" once text may have reached the
-composer — a retry there could duplicate the prompt.
-"""
-
-import sys
-import unittest
+"""Exercise real child-process timeouts without hanging a real tmux server."""
+import os
 from pathlib import Path
+import sys
+import tempfile
+import time
+import unittest
 from unittest import mock
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-import wrapper_unix  # noqa: E402
+import wrapper_unix
 
 
-class UnixInjectContractTests(unittest.TestCase):
-    @mock.patch.object(wrapper_unix.time, "sleep")
-    @mock.patch.object(wrapper_unix.subprocess, "run")
-    def test_returns_explicit_success_only_after_text_and_enter(self, run, _sleep):
-        run.side_effect = [
-            mock.Mock(returncode=0), mock.Mock(returncode=0),
-            mock.Mock(returncode=0), mock.Mock(returncode=1),
-        ]
-        self.assertEqual(
-            wrapper_unix.inject("task", tmux_session="s"), "injected"
-        )
-        self.assertEqual(
-            wrapper_unix.inject("task", tmux_session="s"),
-            "injected-uncertain",
-        )
-
-    @mock.patch.object(wrapper_unix.subprocess, "run")
-    def test_text_rejection_is_retryable_and_timeout_is_uncertain(self, run):
-        run.return_value = mock.Mock(returncode=1)
-        self.assertEqual(
-            wrapper_unix.inject("task", tmux_session="s"), "deferred"
-        )
-        run.side_effect = wrapper_unix.subprocess.TimeoutExpired("tmux", 1)
-        self.assertEqual(
-            wrapper_unix.inject("task", tmux_session="s"),
-            "injected-uncertain",
-        )
-
-
-if __name__ == "__main__":
-    unittest.main()
+@unittest.skipIf(sys.platform == 'win32', 'Unix executable fixture')
+class InjectTimeoutTests(unittest.TestCase):
+    def test_stuck_delivery_and_cleanup_return_without_retyping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = root / 'calls'
+            executable = root / 'tmux'
+            executable.write_text(
+                '#!' + sys.executable + '\n'
+                'import os, sys, time\n'
+                'verb = sys.argv[1]\n'
+                'with open(os.environ["TEST_TMUX_CALLS"], "a") as f: f.write(verb + "\\n")\n'
+                'if verb == os.environ["TEST_TMUX_STALL"]: time.sleep(30)\n'
+                'if verb == "display-message": print("%7")\n'
+                'if verb == "paste-buffer" and os.environ["TEST_TMUX_STALL"] == "delete-buffer": sys.exit(1)\n'
+            )
+            executable.chmod(0o755)
+            for stalled in ['display-message', 'load-buffer', 'paste-buffer', 'send-keys', 'delete-buffer']:
+                with self.subTest(stalled=stalled):
+                    calls.write_text('')
+                    env = {'PATH': str(root) + os.pathsep + os.environ.get('PATH', ''),
+                           'TEST_TMUX_CALLS': str(calls), 'TEST_TMUX_STALL': stalled}
+                    with mock.patch.dict(os.environ, env), mock.patch.object(wrapper_unix, 'TMUX_COMMAND_TIMEOUT', .2):
+                        start = time.monotonic()
+                        ok = wrapper_unix.inject('short test', tmux_session='test', delay=0)
+                        elapsed = time.monotonic() - start
+                    verbs = calls.read_text().splitlines()
+                    self.assertIs(ok, False)
+                    self.assertLess(elapsed, 3, 'a child-process hang must be bounded')
+                    self.assertLessEqual(verbs.count('paste-buffer'), 1, 'do not retry a possibly delivered paste')
+                    self.assertLessEqual(verbs.count('send-keys'), 1, 'do not repeat Enter')
+                    if stalled != 'send-keys':
+                        self.assertNotIn('send-keys', verbs, 'no Enter after an earlier failure')
